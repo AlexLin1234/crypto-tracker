@@ -10,10 +10,12 @@ trading bot.** The prediction task in Milestone 7 exists as a vehicle for
 demonstrating evaluation rigor, not as a claim that anything here is
 profitable.
 
-> **Project status: Milestone 0 complete.** Three exchanges probed live, 1,004
-> real frames captured as test fixtures, message schemas documented in
-> [`docs/SCHEMAS.md`](docs/SCHEMAS.md), and the exchange pair chosen on
-> evidence. Milestone 1 (ingestion into Redpanda) is next.
+> **Project status: Milestone 1 complete.** Reconnaissance done and schemas
+> documented from real captures ([`docs/SCHEMAS.md`](docs/SCHEMAS.md));
+> ingestion service built with per-venue connectors behind a shared interface,
+> normalization into a common schema, Redpanda producer, reconnect with
+> backoff, and graceful shutdown. 65 tests pass. Milestone 2 (order book
+> reconstruction) is next.
 
 ## Exchanges
 
@@ -50,35 +52,99 @@ Python 3.11+ / `uv`, `websockets` for ingestion, Redpanda as the broker,
 PySpark Structured Streaming for processing, Parquet on local disk partitioned
 by date/hour, DuckDB for analytics, `pytest`, Docker Compose for local infra.
 
-## Quickstart (reconnaissance only, so far)
+## Quickstart
 
 ```bash
 uv sync
-uv run python scripts/recon/kraken.py      # prints 10 live frames, saves samples
-uv run python scripts/recon/coinbase.py
-uv run python scripts/recon/binance_us.py
+docker compose up -d          # Redpanda + Console
+./scripts/create_topics.sh    # trades.raw, orderbook.raw, divergence.events
+
+# one process per venue
+uv run python -m xstream.ingest --exchange kraken     --brokers localhost:19092
+uv run python -m xstream.ingest --exchange binance_us --brokers localhost:19092
 ```
 
-Pass `--limit N` to capture more frames. Check the exit code before committing
-any samples — exit `3` means the venue rejected the subscription and the
-captured frames are errors, not market data. See
-[`docs/samples/README.md`](docs/samples/README.md).
+Then open the Redpanda Console at <http://localhost:8080> to inspect topics.
 
-Requires outbound network access to the exchanges. If the scripts report
+Omit `--brokers` to normalize and count messages without producing — useful for
+checking a feed without standing up infrastructure.
+
+### Replay without a live connection
+
+The captured fixtures can be pushed through the exact same connector,
+normalizer and sink that production uses:
+
+```bash
+uv run python -m xstream.ingest.replay                        # in memory
+uv run python -m xstream.ingest.replay --brokers localhost:19092
+```
+
+This is how the pipeline is verified in environments that cannot reach the
+exchanges, and it is what Milestone 2's deterministic order book tests and
+Milestone 6's accelerated load tests build on.
+
+### Reconnaissance
+
+```bash
+uv run python scripts/recon/kraken.py --limit 500
+```
+
+Check the exit code before committing samples — exit `3` means the venue
+rejected the subscription and the frames are errors, not market data. See
+[`docs/samples/README.md`](docs/samples/README.md). If the scripts report
 `proxy rejected connection: HTTP 403`, you are behind a restrictive egress
 policy — see [`DECISIONS.md`](DECISIONS.md) D-000.
 
 ## Repository layout
 
 ```
-scripts/recon/     per-exchange connectivity probes (Milestone 0)
-src/xstream/       pipeline packages (Milestones 1+)
-tests/             pytest suite
-docs/samples/      captured raw frames, used as test fixtures
-docs/SCHEMAS.md    real message schemas per venue, from captured data
-docker/            Redpanda + Console compose stack (Milestone 1)
-DECISIONS.md       running log of design decisions and tradeoffs
+scripts/recon/          per-exchange connectivity probes (Milestone 0)
+scripts/create_topics.sh
+src/xstream/ingest/     connectors, normalization, producer, runner
+  schema.py             the common internal schema every venue maps onto
+  base.py               the shared connector interface
+  kraken.py             Kraken v2 dialect
+  binance_us.py         Binance.US dialect
+  producer.py           topic routing, partition keying, Redpanda sink
+  runner.py             connect/reconnect/metrics/shutdown
+  replay.py             fixture replay through the real path
+tests/                  pytest suite
+docs/samples/           captured raw frames, used as test fixtures
+docs/SCHEMAS.md         real message schemas per venue, from captured data
+docker-compose.yml      Redpanda + Console
+DECISIONS.md            running log of design decisions and tradeoffs
 ```
+
+## The normalization layer
+
+The two venues disagree on essentially every representational choice: envelope
+shape, number encoding, timestamp format, symbol spelling, level structure, and
+how book integrity is verified at all. `schema.py` is where those disagreements
+are resolved exactly once.
+
+| | Kraken v2 | Binance.US |
+| --- | --- | --- |
+| Subscribe | frame, acked per (channel, symbol) | **URL path**, no ack |
+| Envelope | `channel` + `type` | `stream` + `data` |
+| Numbers | **JSON floats** | decimal strings |
+| Timestamps | ISO 8601 | epoch millis |
+| Symbols | `BTC/USD` | `BTCUSD` |
+| Book integrity | **CRC32 checksum** | **update IDs** |
+
+Two consequences worth calling out, both of which would be silent bugs:
+
+- Kraken's JSON numbers become binary floats inside `json.loads` unless it is
+  told otherwise. Order books key on exact price equality, so a price one ULP
+  off is a *different level* — removals miss and the book accumulates phantom
+  levels. Everything parses with `parse_float=Decimal`, and `Decimal` survives
+  to the broker as a string rather than a JSON number.
+- Binance's `m` flag means "the buyer is the maker", so `m: true` is a **sell**
+  aggression. Inverting it would flip the volume-imbalance feature's sign with
+  nothing downstream to catch it.
+
+Because neither venue has both integrity mechanisms, `BookDelta` carries both
+as optional fields rather than collapsing them into one — the pipeline should
+not pretend a checksum and a sequence number are the same thing.
 
 ## Documentation
 

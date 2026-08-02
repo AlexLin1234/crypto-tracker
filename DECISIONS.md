@@ -257,3 +257,121 @@ frames:
   connector must read the ack rather than assume it got what it asked for.
 - The snapshot held 6,334 bid and 16,725 ask levels in one ~570 KB frame, so
   reconnect cost on this venue is dominated by snapshot size.
+
+---
+
+## D-007: Redpanda over Apache Kafka for local development
+
+**Date:** 2026-08-02
+
+Both speak the Kafka protocol, so nothing downstream can tell them apart —
+Spark's Kafka source, `confluent-kafka`, and Redpanda Console are all
+protocol-level clients and none of them needed a Redpanda-specific code path.
+
+Redpanda wins on the thing that actually matters for a project someone else has
+to run: it is a single binary with no ZooKeeper and no KRaft bootstrap
+ceremony, and it starts in seconds in one container. The README promises a
+five-minute quickstart, and a two-service compose file keeps that promise where
+a Kafka + controller setup would not.
+
+The trade is that this is *not* what production would look like. Managed Kafka
+(MSK, Confluent Cloud) brings multi-AZ replication, IAM integration and someone
+else's pager. Because the protocol is identical, that migration is a broker
+address change rather than a rewrite — which is the point of choosing on the
+protocol rather than the implementation.
+
+---
+
+## D-008: Partition by canonical symbol
+
+**Date:** 2026-08-02
+
+Messages are keyed by canonical symbol (`BTC-USD`), not by exchange, and not by
+`(exchange, symbol)`.
+
+Kafka guarantees ordering *within a partition only*. Keying by symbol means:
+
+- **Per-venue ordering is preserved.** Both venues' `BTC-USD` messages share a
+  partition, and each venue's messages keep their relative order within it.
+  Order book reconstruction (Milestone 2) needs a venue's own updates in order;
+  it does not care that another venue's updates are interleaved.
+- **The cross-exchange join gets locality for free.** Milestone 4 joins the two
+  venues on `(symbol, event_time_window)`. Keying by symbol puts both sides of
+  that join in the same partition, so the join does not require a repartition
+  shuffle to co-locate them.
+
+**The cost, stated up front:** with two symbols, exactly two partitions ever
+receive data, no matter how many the topic has. Topics are created with six
+partitions, so four sit idle. Partition count cannot be reduced later, and
+increasing it remaps keys and breaks per-key ordering across the change, so six
+is a bet on adding symbols rather than a claim that six are used.
+
+This is deliberate, known skew. Milestone 6 is where it gets measured — an
+unbalanced consumer group and a skewed Spark stage are on that milestone's list
+precisely because this decision guarantees them.
+
+The alternative, keying by `(exchange, symbol)`, doubles usable parallelism and
+would be the right call at higher venue counts. It was rejected because it
+splits the two sides of the Milestone 4 join across partitions, buying
+parallelism the project does not yet need at the cost of the join it does.
+
+---
+
+## D-009: At-least-once delivery, chosen rather than defaulted into
+
+**Date:** 2026-08-02
+
+The producer runs with `enable.idempotence: False` and `retries: 5`. A retry
+after an ambiguous failure can therefore duplicate a message.
+
+This is a deliberate choice, not an oversight. Exactly-once across a Kafka
+pipeline requires the idempotent producer plus transactional reads downstream,
+which costs throughput and adds coordination that has to be maintained. Market
+data does not need it, because **duplicates are detectable from the venues' own
+data**: Binance messages carry `U`/`u` update IDs and Kraken trades carry
+`trade_id`, so a duplicate is identifiable at the consumer without any broker
+guarantee. Dropping a message would be the expensive failure; seeing one twice
+is not.
+
+What this means concretely: Milestone 2's book reconstruction must be
+idempotent with respect to replayed updates, and Milestone 3's aggregations
+must deduplicate on `(exchange, symbol, trade_id)` rather than assume each
+message arrives once. Both are written down here so they are requirements
+rather than surprises.
+
+---
+
+## D-010: What Milestone 1 could not be verified against
+
+**Date:** 2026-08-02
+
+Two legs of the Milestone 1 done-criterion cannot be exercised in the cloud
+development environment, for the same class of reason as D-000:
+
+1. **Live websocket ingestion.** Exchange hosts remain denied by the
+   environment's network policy.
+2. **Redpanda itself.** Docker Hub image pulls fail here. The manifest is
+   fetched successfully from `index.docker.io`, but the layer blobs are served
+   from `production.cloudfront.docker.com`, which is not on the allowlist —
+   the list includes `production.cloudflare.docker.com`, a different CDN. No
+   image can be pulled, `alpine` included, so this is not specific to Redpanda.
+
+What was verified instead, and how:
+
+- **Normalization**, against all 1,000 captured frames from both venues: 975
+  normalized messages, 0 errors, exact expected counts per message type.
+- **The full ingestion path** end to end via `xstream.ingest.replay`, which
+  feeds real captured frames through the same connector, normalizer, schema and
+  sink that production uses. Only the transport differs.
+- **Reconnect with exponential backoff**, twice over: injected into a fake
+  socket in `tests/test_runner.py`, and observed live against the blocked
+  network, where the denied connections produced four reconnects with jittered
+  delays growing 0.57s → 1.29s → 0.74s → 3.87s.
+- **Graceful shutdown on SIGTERM**, observed live: signal caught, loop exited,
+  metrics reported, producer flushed.
+
+What remains genuinely unverified: that the venues accept these subscribe
+frames over a live socket (the captured fixtures say the payloads are right,
+but the fixtures were captured by the recon probes, not by these connectors),
+and that messages land in Redpanda topics and appear in Console. Both need a
+machine that can reach Docker Hub and the exchanges.

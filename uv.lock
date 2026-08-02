@@ -1581,20 +1581,16 @@ name = "xstream"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "confluent-kafka" },
     { name = "python-dotenv" },
+    { name = "sortedcontainers" },
+    { name = "structlog" },
     { name = "websockets" },
 ]
 
 [package.optional-dependencies]
-book = [
-    { name = "sortedcontainers" },
-]
 dashboard = [
     { name = "streamlit" },
-]
-ingest = [
-    { name = "confluent-kafka" },
-    { name = "structlog" },
 ]
 ml = [
     { name = "lightgbm" },
@@ -1615,7 +1611,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "confluent-kafka", marker = "extra == 'ingest'", specifier = ">=2.5" },
+    { name = "confluent-kafka", specifier = ">=2.15.0" },
     { name = "duckdb", marker = "extra == 'processing'", specifier = ">=1.0" },
     { name = "lightgbm", marker = "extra == 'ml'", specifier = ">=4.3" },
     { name = "pandas", marker = "extra == 'processing'", specifier = ">=2.2" },
@@ -1623,12 +1619,12 @@ requires-dist = [
     { name = "pyspark", marker = "extra == 'processing'", specifier = ">=3.5" },
     { name = "python-dotenv", specifier = ">=1.0" },
     { name = "scikit-learn", marker = "extra == 'ml'", specifier = ">=1.5" },
-    { name = "sortedcontainers", marker = "extra == 'book'", specifier = ">=2.4" },
+    { name = "sortedcontainers", specifier = ">=2.4.0" },
     { name = "streamlit", marker = "extra == 'dashboard'", specifier = ">=1.36" },
-    { name = "structlog", marker = "extra == 'ingest'", specifier = ">=24.1" },
+    { name = "structlog", specifier = ">=26.1.0" },
     { name = "websockets", specifier = ">=13.0" },
 ]
-provides-extras = ["ingest", "book", "processing", "ml", "dashboard"]
+provides-extras = ["processing", "ml", "dashboard"]
 
 [package.metadata.requires-dev]
 dev = [
