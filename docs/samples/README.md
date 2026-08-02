@@ -27,8 +27,27 @@ uv run python scripts/recon/binance_us.py
 ```
 
 Each script writes `docs/samples/<exchange>.jsonl` and prints what it captured.
-Commit the resulting files.
+Use `--limit N` to capture more than the default 10 frames; a few hundred from
+each venue makes a much better Milestone 2 replay fixture and costs nothing:
 
-Note that the subscribe payloads in those scripts are written from prior
-knowledge and are **unconfirmed**. If an exchange replies with an error frame,
-that frame is the authority — fix the script, do not fix the exchange.
+```bash
+uv run python scripts/recon/kraken.py --limit 500
+```
+
+## Read the exit code before committing
+
+| Exit | Meaning |
+| --- | --- |
+| `0` | Clean capture. Safe to commit. |
+| `1` | Could not connect. Nothing useful written. |
+| `2` | Connected but no frames arrived within the timeout. |
+| `3` | **The venue rejected a subscription.** Frames were captured, but they are error frames. Do not commit them. |
+
+Exit code `3` is the one that matters. The subscribe payloads in these scripts
+are written from prior knowledge and are **unconfirmed** — no live socket or
+documentation page was reachable when they were written. If an exchange replies
+with an error frame, that frame is the authority: fix the script's subscribe
+payload to match what the venue actually wants, then re-run.
+
+Once real samples exist, `DECISIONS.md` D-000 gets closed out and the exchange
+selection (Milestone 0 task 3) gets recorded with actual reasoning.

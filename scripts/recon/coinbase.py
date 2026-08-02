@@ -15,7 +15,7 @@ environment (egress to coinbase.com is blocked here). Trust any error frame the
 server returns over this file.
 """
 
-from _common import capture, run
+from _common import capture, parse_args, run
 
 URL = "wss://ws-feed.exchange.coinbase.com"
 
@@ -32,4 +32,13 @@ SUBSCRIPTIONS = [
 ]
 
 if __name__ == "__main__":
-    run(capture(exchange="coinbase", url=URL, subscriptions=SUBSCRIPTIONS, limit=10))
+    args = parse_args("coinbase")
+    run(
+        capture(
+            exchange="coinbase",
+            url=URL,
+            subscriptions=SUBSCRIPTIONS,
+            limit=args.limit,
+            timeout=args.timeout,
+        )
+    )

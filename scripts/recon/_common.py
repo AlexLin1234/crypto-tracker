@@ -11,6 +11,7 @@ been silently reshaped by the capture tool is worse than no fixture at all.
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
 import os
@@ -23,11 +24,29 @@ from websockets.asyncio.client import connect
 SAMPLES_DIR = pathlib.Path(__file__).resolve().parents[2] / "docs" / "samples"
 
 
+def parse_args(exchange: str) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=f"Capture raw frames from {exchange}")
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=10,
+        help="number of frames to capture (default: 10)",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=45.0,
+        help="seconds to wait for a single frame before giving up (default: 45)",
+    )
+    return parser.parse_args()
+
+
 def _connect_kwargs() -> dict[str, Any]:
     """Build connect() kwargs, honouring an optional HTTP CONNECT proxy.
 
-    Most people running this need nothing here. It matters only in sandboxed or
-    corporate-network environments where direct egress is not available.
+    Most people running this need nothing here; websockets reads HTTPS_PROXY
+    from the environment on its own. XSTREAM_WS_PROXY exists only to override
+    that explicitly in sandboxed or corporate-network environments.
     """
     kwargs: dict[str, Any] = {
         # Exchanges are chatty; a generous queue avoids the client dropping
@@ -37,10 +56,38 @@ def _connect_kwargs() -> dict[str, Any]:
     }
     proxy = os.environ.get("XSTREAM_WS_PROXY") or ""
     if proxy:
-        # websockets >= 14 accepts proxy=; older versions do not. Fail loudly
-        # rather than silently connecting direct and appearing to work.
         kwargs["proxy"] = proxy
     return kwargs
+
+
+def looks_like_error(payload: Any) -> str | None:
+    """Return an error description if this frame looks like a rejection.
+
+    The subscribe payloads in these scripts are written from prior knowledge and
+    are unconfirmed. Without this check, a wrong subscribe shape would produce a
+    capture full of error frames that still exited 0 -- and those frames would
+    then be committed as if they were real market data fixtures.
+
+    Each venue signals errors differently, so this is a deliberately broad
+    heuristic. False positives are cheap (a warning); false negatives are not.
+    """
+    if not isinstance(payload, dict):
+        return None
+
+    # Coinbase Exchange: {"type": "error", "message": ..., "reason": ...}
+    if payload.get("type") == "error":
+        return str(payload.get("message") or payload.get("reason") or payload)
+
+    # Kraken v2: {"method": "subscribe", "success": false, "error": ...}
+    if payload.get("success") is False:
+        return str(payload.get("error") or payload)
+
+    # Binance: {"error": {"code": ..., "msg": ...}}
+    err = payload.get("error")
+    if err:
+        return str(err)
+
+    return None
 
 
 async def capture(
@@ -51,14 +98,11 @@ async def capture(
     limit: int = 10,
     timeout: float = 45.0,
 ) -> int:
-    """Connect, send each subscription, print and save `limit` messages.
+    """Connect, send each subscription, print and save `limit` frames.
 
-    Returns a process exit code: 0 on success, non-zero if we could not get the
-    requested number of messages. Saves raw frames to docs/samples/.
-
-    Every frame is written exactly as received (one JSON object per line), with
-    a local receive timestamp added as a sibling wrapper field rather than
-    mutating the payload itself.
+    Frames are written exactly as received, one per line, with nothing added and
+    nothing removed. Returns a process exit code: 0 on a clean capture, non-zero
+    if the connection failed, timed out, or the venue rejected a subscription.
     """
     SAMPLES_DIR.mkdir(parents=True, exist_ok=True)
     out_path = SAMPLES_DIR / f"{exchange}.jsonl"
@@ -73,32 +117,54 @@ async def capture(
                 print(f"[{exchange}] -> {json.dumps(sub)}")
 
             received = 0
+            errors: list[str] = []
+
             with out_path.open("w", encoding="utf-8") as fh:
                 while received < limit:
                     try:
                         raw = await asyncio.wait_for(ws.recv(), timeout=timeout)
                     except asyncio.TimeoutError:
                         print(
-                            f"[{exchange}] TIMEOUT after {received} message(s); "
-                            f"no frame within {timeout}s",
+                            f"[{exchange}] TIMEOUT after {received} frame(s); "
+                            f"nothing received within {timeout}s",
                             file=sys.stderr,
                         )
                         return 2
 
                     received += 1
-                    # Keep the raw text. Parsing is only for pretty-printing and
-                    # for surfacing exchange-side subscription errors early.
-                    fh.write(raw if isinstance(raw, str) else raw.decode())
+                    text = raw if isinstance(raw, str) else raw.decode()
+                    fh.write(text)
                     fh.write("\n")
 
                     try:
-                        parsed = json.loads(raw)
-                        pretty = json.dumps(parsed)[:400]
-                    except (json.JSONDecodeError, TypeError):
-                        pretty = str(raw)[:400]
-                    print(f"[{exchange}] <- [{received}] {pretty}")
+                        parsed = json.loads(text)
+                    except json.JSONDecodeError:
+                        print(f"[{exchange}] <- [{received}] {text[:400]}")
+                        continue
 
-            print(f"[{exchange}] captured {received} message(s) -> {out_path}")
+                    problem = looks_like_error(parsed)
+                    if problem:
+                        errors.append(problem)
+                        print(
+                            f"[{exchange}] <- [{received}] ERROR FRAME: {problem}",
+                            file=sys.stderr,
+                        )
+                    else:
+                        print(f"[{exchange}] <- [{received}] {json.dumps(parsed)[:400]}")
+
+            print(f"[{exchange}] captured {received} frame(s) -> {out_path}")
+
+            if errors:
+                print(
+                    f"\n[{exchange}] REJECTED: {len(errors)} of {received} frames were "
+                    f"errors. The subscribe payload in scripts/recon/{exchange}.py is "
+                    f"probably wrong -- the venue's error frame is the authority, not "
+                    f"that file. Do NOT commit {out_path.name} as a fixture.\n"
+                    f"[{exchange}] first error: {errors[0]}",
+                    file=sys.stderr,
+                )
+                return 3
+
             return 0
 
     except OSError as exc:

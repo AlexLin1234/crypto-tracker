@@ -17,7 +17,7 @@ have NOT been confirmed against live docs or a live socket in this environment
 (egress to binance.us is blocked here).
 """
 
-from _common import capture, run
+from _common import capture, parse_args, run
 
 # @depth is the L2 diff stream; @trade is the per-trade stream. Lowercase symbol
 # names are required by Binance.
@@ -25,4 +25,13 @@ STREAMS = ["btcusd@depth", "btcusd@trade", "ethusd@depth", "ethusd@trade"]
 URL = "wss://stream.binance.us:9443/stream?streams=" + "/".join(STREAMS)
 
 if __name__ == "__main__":
-    run(capture(exchange="binance_us", url=URL, subscriptions=[], limit=10))
+    args = parse_args("binance_us")
+    run(
+        capture(
+            exchange="binance_us",
+            url=URL,
+            subscriptions=[],
+            limit=args.limit,
+            timeout=args.timeout,
+        )
+    )

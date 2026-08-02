@@ -10,7 +10,7 @@ whole point of this script is to confirm or refute them. If Kraken replies with
 an error frame, trust the error frame over this file and correct it.
 """
 
-from _common import capture, run
+from _common import capture, parse_args, run
 
 URL = "wss://ws.kraken.com/v2"
 
@@ -35,4 +35,13 @@ SUBSCRIPTIONS = [
 ]
 
 if __name__ == "__main__":
-    run(capture(exchange="kraken", url=URL, subscriptions=SUBSCRIPTIONS, limit=10))
+    args = parse_args("kraken")
+    run(
+        capture(
+            exchange="kraken",
+            url=URL,
+            subscriptions=SUBSCRIPTIONS,
+            limit=args.limit,
+            timeout=args.timeout,
+        )
+    )

@@ -44,6 +44,11 @@ uv run python scripts/recon/coinbase.py
 uv run python scripts/recon/binance_us.py
 ```
 
+Pass `--limit N` to capture more frames. Check the exit code before committing
+any samples — exit `3` means the venue rejected the subscription and the
+captured frames are errors, not market data. See
+[`docs/samples/README.md`](docs/samples/README.md).
+
 Requires outbound network access to the exchanges. If the scripts report
 `proxy rejected connection: HTTP 403`, you are behind a restrictive egress
 policy — see [`DECISIONS.md`](DECISIONS.md) D-000.

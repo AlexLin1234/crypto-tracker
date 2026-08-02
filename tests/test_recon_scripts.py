@@ -60,3 +60,42 @@ def test_capture_helper_writes_into_docs_samples() -> None:
     common = _load("_common")
     assert common.SAMPLES_DIR.name == "samples"
     assert common.SAMPLES_DIR.parent.name == "docs"
+
+
+# --- error-frame detection ---------------------------------------------------
+# Guards the case where an unconfirmed subscribe payload is rejected: without
+# this, a capture full of error frames would exit 0 and get committed as a
+# fixture. The error shapes below are the documented conventions of each venue.
+
+
+@pytest.mark.parametrize(
+    "frame,expected_fragment",
+    [
+        ({"type": "error", "message": "Failed to subscribe"}, "Failed to subscribe"),
+        ({"type": "error", "reason": "invalid channel"}, "invalid channel"),
+        ({"method": "subscribe", "success": False, "error": "Bad request"}, "Bad request"),
+        ({"error": {"code": -1121, "msg": "Invalid symbol."}}, "Invalid symbol."),
+    ],
+)
+def test_error_frames_are_detected(frame: dict, expected_fragment: str) -> None:
+    common = _load("_common")
+    problem = common.looks_like_error(frame)
+    assert problem is not None
+    assert expected_fragment in problem
+
+
+@pytest.mark.parametrize(
+    "frame",
+    [
+        {"channel": "book", "type": "snapshot", "data": [{"bids": [], "asks": []}]},
+        {"type": "l2update", "product_id": "BTC-USD", "changes": []},
+        {"method": "subscribe", "success": True, "result": {"channel": "trade"}},
+        {"stream": "btcusd@trade", "data": {"p": "60000.00", "q": "0.01"}},
+        {"type": "heartbeat", "sequence": 12345},
+        "not-a-dict",
+        [1, 2, 3],
+    ],
+)
+def test_normal_frames_are_not_flagged(frame) -> None:
+    common = _load("_common")
+    assert common.looks_like_error(frame) is None
