@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+
+# Environment / secrets
+.env
+
+# Data lake + streaming state (never commit captured market data)
+data/
+checkpoints/
+spark-warehouse/
+*.parquet
+
+# Recorded replay fixtures are large; sample payloads under docs/samples/ are
+# committed deliberately, but bulk recordings are not.
+recordings/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
