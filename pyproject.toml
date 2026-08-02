@@ -1,0 +1,60 @@
+[project]
+name = "xstream"
+version = "0.1.0"
+description = "Cross-exchange crypto market data streaming pipeline"
+readme = "README.md"
+requires-python = ">=3.11"
+
+# Milestone 0 needs only a websocket client and env loading. Dependencies for
+# later milestones are declared as optional groups so that `uv sync` stays fast
+# and reproducible while the project is still in reconnaissance. They get
+# promoted into the main list as each milestone actually starts using them.
+dependencies = [
+    "websockets>=13.0",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+# Milestone 1: Redpanda producer + structured logging
+ingest = [
+    "confluent-kafka>=2.5",
+    "structlog>=24.1",
+]
+# Milestone 2: order book state
+book = [
+    "sortedcontainers>=2.4",
+]
+# Milestones 3-5: Spark, Parquet, DuckDB
+processing = [
+    "pyspark>=3.5",
+    "pyarrow>=16.0",
+    "duckdb>=1.0",
+    "pandas>=2.2",
+]
+# Milestone 7: modelling
+ml = [
+    "scikit-learn>=1.5",
+    "lightgbm>=4.3",
+]
+# Milestone 8: dashboard
+dashboard = [
+    "streamlit>=1.36",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/xstream"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+asyncio_mode = "auto"
