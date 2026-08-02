@@ -66,6 +66,9 @@ uv run python -m xstream.ingest --exchange binance_us --brokers localhost:19092
 
 Then open the Redpanda Console at <http://localhost:8080> to inspect topics.
 
+Redpanda is not required — the pipeline speaks the Kafka protocol, so any
+Kafka-compatible broker works. Point `--brokers` at whatever is running.
+
 Omit `--brokers` to normalize and count messages without producing — useful for
 checking a feed without standing up infrastructure.
 

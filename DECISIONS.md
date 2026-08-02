@@ -345,16 +345,52 @@ rather than surprises.
 
 **Date:** 2026-08-02
 
-Two legs of the Milestone 1 done-criterion cannot be exercised in the cloud
-development environment, for the same class of reason as D-000:
+**No container image can be pulled in this environment.** Registry manifests
+fetch fine, but every registry serves layer blobs from a CDN host that is not
+on the allowlist:
+
+| Registry | Blob host | Result |
+| --- | --- | --- |
+| Docker Hub | `production.cloudfront.docker.com` | denied |
+| ECR Public | `*.cloudfront.net` | denied |
+| ghcr.io | `pkg-containers.githubusercontent.com` | denied |
+
+The allowlist contains `production.cloudflare.docker.com` — a different CDN
+from the `cloudfront` host actually used. This is not specific to Redpanda:
+`alpine` fails identically from every registry above.
+
+**The broker leg was verified anyway, without Docker.** `downloads.apache.org`
+*is* on the allowlist and a JDK is pre-installed, so Apache Kafka 4.1.2 runs
+directly in KRaft mode. Redpanda is Kafka-API-compatible and `confluent-kafka`
+speaks the Kafka protocol to either, so the producer path, topic routing and
+partition keying are exercised identically. What this does **not** verify is
+the Redpanda-specific configuration in `docker-compose.yml` — the listener
+split and the healthcheck are still unexercised.
+
+Against a real broker, with the 1,000 captured frames replayed through the
+production producer:
+
+```
+orderbook.raw   partition 2: 328    partition 3: 639
+trades.raw      partition 2:   1    partition 3:   7
+```
+
+Every D-008 claim is now measured rather than asserted:
+
+- **Both venues' same symbol share a partition.** Partition 2 held BTC-USD from
+  binance_us (201) and kraken (127); partition 3 held ETH-USD from both. This
+  is the partition locality the Milestone 4 join depends on.
+- **Only 2 of 6 partitions receive data**, exactly the deliberate skew D-008
+  predicted. Milestone 6 now has a measured starting point rather than a guess.
+
+D-003 and D-004 also survive the broker boundary: a stored Kraken book message
+reads `"bids": [["63348.4", "0.12158347"]]` — decimal strings, not JSON numbers
+— alongside `"checksum": 2976216659` and `"first_sequence": null`.
+
+The one leg still unverified is:
 
 1. **Live websocket ingestion.** Exchange hosts remain denied by the
    environment's network policy.
-2. **Redpanda itself.** Docker Hub image pulls fail here. The manifest is
-   fetched successfully from `index.docker.io`, but the layer blobs are served
-   from `production.cloudfront.docker.com`, which is not on the allowlist —
-   the list includes `production.cloudflare.docker.com`, a different CDN. No
-   image can be pulled, `alpine` included, so this is not specific to Redpanda.
 
 What was verified instead, and how:
 
@@ -369,9 +405,12 @@ What was verified instead, and how:
   delays growing 0.57s → 1.29s → 0.74s → 3.87s.
 - **Graceful shutdown on SIGTERM**, observed live: signal caught, loop exited,
   metrics reported, producer flushed.
+- **Production into a real Kafka-protocol broker**, with per-partition offsets
+  and stored message contents inspected, as above.
 
-What remains genuinely unverified: that the venues accept these subscribe
-frames over a live socket (the captured fixtures say the payloads are right,
-but the fixtures were captured by the recon probes, not by these connectors),
-and that messages land in Redpanda topics and appear in Console. Both need a
-machine that can reach Docker Hub and the exchanges.
+What remains genuinely unverified is narrow and specific: that the venues
+accept *these connectors'* subscribe frames over a live socket. The captured
+fixtures say the payloads are right, but those fixtures were produced by the
+recon probes, not by the connectors. Also unexercised is the Redpanda container
+configuration itself, as distinct from the Kafka protocol behaviour it serves.
+Both need a machine that can reach the exchanges and a container registry.
