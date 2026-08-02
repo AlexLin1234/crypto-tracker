@@ -7,7 +7,16 @@ why. This is the primary source material for the README's design section.
 
 ## D-000: Milestone 0 blocked in the cloud dev environment — exchange egress denied
 
-**Status:** BLOCKED, awaiting a decision (see "Options" below).
+**Status:** RESOLVED 2026-08-02. The recon scripts were run on a machine with
+normal egress (option 1 below) and real captures for all three venues are
+committed to `docs/samples/`. All three subscribe payloads were accepted — no
+error frames in 1,004 captured frames — so the unconfirmed payloads written in
+D-000's shadow turned out to be correct. Schemas are documented in
+`docs/SCHEMAS.md`. The cloud environment itself remains unable to reach the
+exchanges; that is a network-policy setting (**Trusted** access level), not a
+code problem, and is fixed by switching the environment to **Custom** access
+with the exchange domains allowlisted.
+
 **Date:** 2026-08-02
 
 ### What happened
@@ -120,3 +129,131 @@ Milestone 1 concern and belongs in the connector, where it is unit-tested
 against these fixtures. If the capture tool normalized, the fixtures could not
 be used to test normalization — they would already agree with it by
 construction.
+
+---
+
+## D-003: Kraken sends prices as JSON numbers — parse with Decimal
+
+**Date:** 2026-08-02
+
+Kraken v2 encodes price and quantity as JSON **numbers** (`63348.4`,
+`5.1e-05`). Coinbase and Binance both encode them as strings. Python's
+`json.loads` turns a JSON number into a binary float, so the precision is lost
+inside the parser, before any application code can intervene.
+
+Money in binary floats does not sum or compare exactly, and an order book is
+built entirely on exact price-key matching: a level keyed by a float that is
+one ULP off is a *different level*, so removals silently miss and the book
+accumulates phantom levels. This would surface as unexplained checksum
+failures in Milestone 2 and would be painful to diagnose.
+
+**Decision:** the Kraken connector parses with
+`json.loads(raw, parse_float=Decimal)`. Prices and quantities are `Decimal`
+throughout ingestion and order book state. Conversion to float happens only at
+the Parquet/Spark boundary, where the value is an analytical quantity rather
+than a book key.
+
+Cost: `Decimal` arithmetic is meaningfully slower than float. That is a
+deliberate correctness-over-speed trade at the ingestion layer, and Milestone 6
+should measure what it costs rather than assume.
+
+---
+
+## D-004: Coinbase's L2 feed has no gap-detection mechanism
+
+**Date:** 2026-08-02
+
+Verified against captured frames, not documentation. A Coinbase `l2update`
+frame has exactly these keys:
+
+```
+["changes", "product_id", "time", "type"]
+```
+
+There is no sequence number and no checksum, on either the updates or the
+snapshot. The `sequence` field exists only on the `matches`/`last_match` trade
+channel, which is a separate stream and says nothing about book updates.
+
+The consequence is concrete: **on Coinbase there is no way to know that a book
+update was dropped.** Milestone 2 requires detecting gaps and triggering
+resync rather than silently corrupting state. On this feed that requirement
+cannot be met — the best available substitute is a periodic unconditional
+resync on a timer, which is a mitigation, not a detection.
+
+By contrast:
+
+- **Kraken** carries a CRC32 `checksum` on every snapshot and update. Weaker
+  than a sequence number (it reports that the book is wrong, not how much was
+  missed) but it is a genuine verification signal.
+- **Binance.US** carries `U`/`u` update IDs giving textbook gap detection
+  (`U == previous_u + 1`). Checked against the capture: 493 depth updates
+  across two symbols, **zero discontinuities**.
+
+---
+
+## D-005: Primary exchange pair is Kraken + Binance.US
+
+**Date:** 2026-08-02
+**Status:** Decided on the evidence in D-004. Reversible — see below.
+
+The original plan expected Kraken + Coinbase, on the reasonable prior that both
+are public and no-auth. That prior held: all three venues connected cleanly
+with no auth and accepted the subscriptions. The choice therefore comes down to
+something the plan could not have known in advance, which is exactly what
+Milestone 0 exists to discover.
+
+**Chosen: Kraken + Binance.US.**
+
+Reasoning:
+
+1. **Milestone 2 is the highest-value component of this project, and its
+   defining requirement is gap detection with resync.** Kraken gives a checksum
+   and Binance gives sequence IDs; Coinbase gives neither (D-004). Pairing
+   Kraken with Coinbase would mean gap-detection tests could only be written
+   against one of the two venues, which guts the milestone.
+2. **The two integrity models are genuinely different**, so the order book
+   interface has to abstract over checksum-based verification *and*
+   sequence-based gap detection. That is a more honest distributed-systems
+   design problem — and a better thing to be asked about — than two feeds that
+   work the same way.
+3. **The connectors differ structurally in a useful way.** Binance subscribes
+   via URL path with no ack; Kraken subscribes via frame and acks each
+   (channel, symbol) pair. The shared connector interface has to accommodate
+   both, which is a real constraint rather than a cosmetic one.
+
+**What this costs, stated plainly:** Binance.US is a much thinner venue than
+Coinbase. Cross-exchange divergences found in Milestone 4 will partly reflect
+Binance.US illiquidity rather than genuine cross-venue dislocation. The
+Milestone 4 honesty layer must say so directly — that caveat is the finding,
+not a footnote to it.
+
+**Reversibility:** all three venues are captured in `docs/samples/` and
+documented in `docs/SCHEMAS.md`, and normalization is per-connector behind a
+shared interface. Swapping Binance.US for Coinbase later is a connector change,
+not an architecture change. If Milestone 4's divergence results turn out to be
+dominated by Binance.US thinness, that is the trigger to revisit.
+
+---
+
+## D-006: The Coinbase capture is too thin to be a fixture
+
+**Date:** 2026-08-02
+
+The committed Coinbase capture is only 4 frames: one subscribe ack, one
+snapshot, one `last_match`, one `l2update`. Kraken and Binance.US each have
+500. One book update is not enough to test order book reconstruction against.
+
+This does not block anything right now, because D-005 makes Coinbase a
+non-primary venue. It is recorded so that the thinness is not later mistaken
+for "Coinbase is quiet" — the other two venues captured 500 frames over the
+same kind of window, so the difference is a capture artifact, not a property of
+the feed. If Coinbase is ever promoted to a primary venue, a fresh capture of
+several hundred frames is a prerequisite.
+
+Two Coinbase quirks worth carrying forward regardless, both found in those four
+frames:
+
+- The server acked channel `level2_50` when `level2_batch` was requested. A
+  connector must read the ack rather than assume it got what it asked for.
+- The snapshot held 6,334 bid and 16,725 ask levels in one ~570 KB frame, so
+  reconnect cost on this venue is dominated by snapshot size.

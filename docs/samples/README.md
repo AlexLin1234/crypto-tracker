@@ -1,40 +1,39 @@
 # Sample payloads
 
-**This directory is intentionally empty of samples right now.**
+Real, unmodified frames captured from each exchange, one JSON object per line.
+These are the test fixtures for Milestone 1 (normalization) and Milestone 2
+(order book replay). Captured 2026-08-02.
 
-It is meant to hold real, unmodified frames captured from each exchange, one
-JSON object per line, named `<exchange>.jsonl`. Those files are the test
-fixtures for Milestone 1 (normalization) and Milestone 2 (order book replay).
+| File | Frames | Contents |
+| --- | --- | --- |
+| `kraken.jsonl` | 500 | 472 book updates, 2 book snapshots, 20 heartbeats, 1 trade, 4 subscribe acks, 1 status |
+| `binance_us.jsonl` | 500 | 493 depth updates, 7 trades |
+| `coinbase.jsonl` | 4 | 1 subscribe ack, 1 snapshot, 1 `last_match`, 1 `l2update` |
 
-They are absent because Milestone 0's live verification could not be run in the
-cloud development environment — the egress policy denies all exchange hosts at
-the proxy `CONNECT` stage. See `DECISIONS.md` entry **D-000** for the full
-finding and the options for unblocking.
+No error frames in any of the 1,004 captured frames — every venue accepted its
+subscription. Schemas are documented in [`../SCHEMAS.md`](../SCHEMAS.md).
 
-No placeholder or hand-written samples have been committed here, deliberately.
-Fixtures that were invented rather than captured would silently validate
-whatever the normalizers happened to do, which defeats their entire purpose.
+## Known gap: the Coinbase capture is too thin
 
-## To populate this directory
+Four frames, of which exactly one is a book update. That is not enough to test
+order book reconstruction against. It does not block current work because
+Coinbase is not a primary venue (see `DECISIONS.md` D-005), but the thinness is
+a capture artifact, not a property of the feed — the other two venues captured
+500 frames over a comparable window. If Coinbase is ever promoted to primary, a
+fresh capture of several hundred frames is a prerequisite.
 
-On a machine with normal outbound network access:
+## Re-capturing
+
+On a machine with outbound access to the exchanges:
 
 ```bash
 uv sync
-uv run python scripts/recon/kraken.py
-uv run python scripts/recon/coinbase.py
-uv run python scripts/recon/binance_us.py
+uv run python scripts/recon/kraken.py     --limit 500
+uv run python scripts/recon/coinbase.py   --limit 500
+uv run python scripts/recon/binance_us.py --limit 500
 ```
 
-Each script writes `docs/samples/<exchange>.jsonl` and prints what it captured.
-Use `--limit N` to capture more than the default 10 frames; a few hundred from
-each venue makes a much better Milestone 2 replay fixture and costs nothing:
-
-```bash
-uv run python scripts/recon/kraken.py --limit 500
-```
-
-## Read the exit code before committing
+Check the exit code before committing anything:
 
 | Exit | Meaning |
 | --- | --- |
@@ -43,11 +42,16 @@ uv run python scripts/recon/kraken.py --limit 500
 | `2` | Connected but no frames arrived within the timeout. |
 | `3` | **The venue rejected a subscription.** Frames were captured, but they are error frames. Do not commit them. |
 
-Exit code `3` is the one that matters. The subscribe payloads in these scripts
-are written from prior knowledge and are **unconfirmed** — no live socket or
-documentation page was reachable when they were written. If an exchange replies
-with an error frame, that frame is the authority: fix the script's subscribe
-payload to match what the venue actually wants, then re-run.
+Note that the Coinbase snapshot frame alone is ~570 KB (6,334 bid and 16,725
+ask levels), so a large Coinbase capture is bigger on disk than the frame count
+suggests.
 
-Once real samples exist, `DECISIONS.md` D-000 gets closed out and the exchange
-selection (Milestone 0 task 3) gets recorded with actual reasoning.
+## Cloud sessions
+
+Cloud environments default to **Trusted** network access, which does not
+include the exchanges — the probes fail there with
+`proxy rejected connection: HTTP 403`. To capture from a cloud session, set the
+environment's network access to **Custom**, allowlist `*.kraken.com`,
+`*.coinbase.com` and `*.binance.us`, and keep the "also include default list of
+common package managers" option checked so PyPI and GitHub stay reachable. See
+`DECISIONS.md` D-000.

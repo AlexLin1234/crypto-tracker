@@ -10,12 +10,27 @@ trading bot.** The prediction task in Milestone 7 exists as a vehicle for
 demonstrating evaluation rigor, not as a claim that anything here is
 profitable.
 
-> **Project status: Milestone 0 (reconnaissance), partially complete and
-> currently blocked.** Repo scaffold and the per-exchange recon scripts are
-> done. Live feed verification could not be performed in the cloud development
-> environment because its egress policy denies all exchange hosts. See
-> [`DECISIONS.md`](DECISIONS.md) entry D-000. Nothing downstream has been built
-> — by design, since exchange message schemas are still unverified.
+> **Project status: Milestone 0 complete.** Three exchanges probed live, 1,004
+> real frames captured as test fixtures, message schemas documented in
+> [`docs/SCHEMAS.md`](docs/SCHEMAS.md), and the exchange pair chosen on
+> evidence. Milestone 1 (ingestion into Redpanda) is next.
+
+## Exchanges
+
+**Kraken v2 + Binance.US.** The original plan expected Kraken + Coinbase, since
+both are public and no-auth — a prior that held, as all three venues connected
+cleanly. The choice turned on something reconnaissance had to discover:
+Coinbase's L2 feed carries **no sequence number and no checksum**, so a dropped
+book update cannot be detected at all. Kraken carries a CRC32 checksum and
+Binance.US carries sequence IDs, which means order book gap detection — the
+defining requirement of Milestone 2 — can be built and tested on both venues
+rather than one.
+
+The two venues also verify integrity in genuinely different ways, so the order
+book layer has to abstract over checksum-based verification *and*
+sequence-based gap detection. Full reasoning, including what this costs
+(Binance.US is a thin venue, which will colour the divergence analysis), is in
+[`DECISIONS.md`](DECISIONS.md) D-004 and D-005.
 
 ## Planned architecture
 
@@ -60,6 +75,7 @@ scripts/recon/     per-exchange connectivity probes (Milestone 0)
 src/xstream/       pipeline packages (Milestones 1+)
 tests/             pytest suite
 docs/samples/      captured raw frames, used as test fixtures
+docs/SCHEMAS.md    real message schemas per venue, from captured data
 docker/            Redpanda + Console compose stack (Milestone 1)
 DECISIONS.md       running log of design decisions and tradeoffs
 ```
