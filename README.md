@@ -10,12 +10,44 @@ trading bot.** The prediction task in Milestone 7 exists as a vehicle for
 demonstrating evaluation rigor, not as a claim that anything here is
 profitable.
 
-> **Project status: Milestone 1 complete.** Reconnaissance done and schemas
+> **Project status: Milestone 2 complete, with one documented gap.** Schemas
 > documented from real captures ([`docs/SCHEMAS.md`](docs/SCHEMAS.md));
-> ingestion service built with per-venue connectors behind a shared interface,
-> normalization into a common schema, Redpanda producer, reconnect with
-> backoff, and graceful shutdown. 65 tests pass. Milestone 2 (order book
-> reconstruction) is next.
+> ingestion service with per-venue connectors, normalization, Kafka-protocol
+> producer, reconnect and graceful shutdown; L2 order book reconstruction with
+> gap detection and resync. 83 tests pass. Binance book *seeding* needs a REST
+> snapshot that is unreachable here — see [`DECISIONS.md`](DECISIONS.md) D-012.
+> Milestone 3 (Spark aggregation) is next.
+
+## Order book reconstruction
+
+The stateful core, and the part most likely to be subtly wrong — so it is
+verified against the venue's own integrity mechanism rather than against my
+expectations.
+
+**Replaying the captured Kraken session reproduces all 474 checksums with zero
+mismatches** — one snapshot plus 472 incremental updates, with the CRC32
+recomputed and compared after every single one. That single result verifies two
+things simultaneously: that the checksum algorithm (derived empirically, since
+Kraken's docs are unreachable — D-011) is correct, and that the book
+reconstruction is correct. They cannot both be wrong in a way that agrees 474
+consecutive times.
+
+The two venues fail differently, so they are detected differently:
+
+| | Kraken | Binance.US |
+| --- | --- | --- |
+| Mechanism | CRC32 over top-10 state | `U`/`u` update IDs |
+| Says | "your book is wrong" | "you missed messages" |
+| Checked | **after** applying | **before** applying |
+
+Sequence gaps are checked before mutating, so a detected gap leaves the last
+known-good book intact. Checksums describe the resulting state, so they can
+only be verified after. Both are tested.
+
+On any detected loss the book goes **STALE and stops** — it does not patch or
+interpolate. A book that keeps serving after known corruption is worse than one
+that halts, because every downstream consumer would get plausible numbers with
+no signal they are wrong (D-013).
 
 ## Exchanges
 

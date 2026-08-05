@@ -414,3 +414,117 @@ fixtures say the payloads are right, but those fixtures were produced by the
 recon probes, not by the connectors. Also unexercised is the Redpanda container
 configuration itself, as distinct from the Kafka protocol behaviour it serves.
 Both need a machine that can reach the exchanges and a container registry.
+
+---
+
+## D-011: Kraken's checksum algorithm was derived from data, not documentation
+
+**Date:** 2026-08-02
+
+Milestone 2 needs Kraken's book checksum to detect corruption, and
+`docs.kraken.com` is behind the same egress denial as the feed itself (D-000),
+so the algorithm could not be read. It was derived instead, by brute-forcing
+candidate formulations against the captured snapshot's real checksum and
+keeping the one that reproduced it:
+
+> Each level contributes its price, then its quantity, rendered at the
+> instrument's precision with the decimal point removed and leading zeros
+> stripped. Asks first, then bids, each best-first, ten levels per side. CRC32
+> of the concatenation.
+
+A single match would be weak evidence — one CRC32 collision is not proof.
+What makes this trustworthy is that the implementation then reproduced
+**every checksum in the capture**: one snapshot plus 472 incremental updates
+per the replay, 474 book messages total, with zero mismatches. A book that had
+drifted by one level, one price or one quantity would have failed on the next
+message.
+
+That result verifies two things at once, which is why it is the centrepiece
+test: the checksum derivation is right, *and* the book reconstruction is right.
+They cannot both be wrong in a way that agrees 474 times.
+
+**The known soft spot** is instrument price precision, which the checksum needs
+and the websocket feed never sends — it is reference data. It is currently
+inferred from the widest price seen in the snapshot. JSON drops trailing zeros,
+so that is a lower bound, and an instrument whose top twenty levels all happen
+to end in zero would infer too narrow a precision. The failure mode is benign:
+the very next checksum mismatches and the book goes stale, rather than silently
+serving corrupt state. The fix, if it ever fires, is to read precision from
+Kraken's instrument reference endpoint.
+
+---
+
+## D-012: Binance books cannot be seeded from the websocket alone
+
+**Date:** 2026-08-02
+**Status:** Open gap in Milestone 2.
+
+Binance's `@depth` stream carries **diffs only**. There is no snapshot on the
+websocket, so a book cannot be built from the stream by itself: the documented
+procedure is to buffer diffs, fetch a REST snapshot from `/api/v3/depth`, then
+discard buffered diffs older than the snapshot's `lastUpdateId` and apply the
+rest.
+
+That REST endpoint is on a blocked host here, so the response shape cannot be
+confirmed. Writing the seeding path against a guessed schema is exactly the
+mistake Milestone 0 exists to prevent (D-000), so it has **not** been written.
+
+What this does and does not cost:
+
+- **Gap detection is complete and tested against real data.** The `U`/`u`
+  sequence rule runs through the book's own detector over the captured
+  Binance updates with zero false positives, and an injected discontinuity
+  makes it fire.
+- **Book *state* for Binance is not reconstructible from the fixture.** The
+  captured session contains no snapshot, so the books stay unseeded and every
+  update is correctly rejected as `REJECTED_NOT_SEEDED`.
+
+Kraken carries snapshots in-stream and is therefore fully reconstructed, which
+is why the checksum replay above is the strong verification. Closing this gap
+needs one captured REST snapshot payload — a single `curl` from a machine with
+access — after which the seeding path is a small amount of code against a known
+shape.
+
+---
+
+## D-013: A book that loses integrity stops rather than degrades
+
+**Date:** 2026-08-02
+
+On a detected gap or checksum mismatch the book transitions to STALE and
+rejects all further updates until a snapshot re-seeds it. It does not attempt
+to patch, interpolate, or carry on.
+
+This is the entire point of having integrity checks. A book that keeps serving
+after a detected loss is worse than one that stops, because everything
+downstream — spread, imbalance, the Milestone 4 divergence detector, the
+Milestone 7 features — would consume plausible-looking numbers with no
+indication they are wrong. Silent corruption in a feature store is the failure
+that is hardest to find later.
+
+Two details follow from it:
+
+- **Sequence gaps are checked before mutating; checksums after.** A sequence
+  number describes the message, so a gap is known before anything is applied
+  and the last known-good book is left intact. A checksum describes the
+  resulting state, so it can only be verified once applied. Tested both ways.
+- **Resync means "take the next snapshot", not anything cleverer.** A snapshot
+  is the venue's own statement of truth and is the only exit from STALE.
+
+---
+
+## D-014: The 30-minute replay recording could not be captured
+
+**Date:** 2026-08-02
+
+Milestone 2 asks for 30+ minutes of recorded messages as a replay fixture. The
+exchanges are unreachable from this environment (D-000), so the fixture is the
+Milestone 0 capture instead: 500 frames per venue, roughly 40 seconds of
+market time.
+
+That is enough for correctness work — it exercised 474 checksum verifications
+and every book code path — but it is **not** enough for the load testing in
+Milestone 6, which needs a long recording to replay at 10x and 100x, nor for
+observing a real gap or reconnect in the wild. Capturing it needs a machine
+with feed access and `scripts/recon/*.py --limit`, which already supports
+arbitrarily long captures.
