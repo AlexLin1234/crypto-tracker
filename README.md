@@ -10,12 +10,63 @@ trading bot.** The prediction task in Milestone 7 exists as a vehicle for
 demonstrating evaluation rigor, not as a claim that anything here is
 profitable.
 
-> **Project status: Milestone 3 complete.** Ingestion, order book
-> reconstruction, and Spark Structured Streaming aggregation into a partitioned
-> Parquet lake queryable from DuckDB. 93 tests pass. Two documented gaps:
-> Binance book *seeding* needs an unreachable REST snapshot
-> ([`DECISIONS.md`](DECISIONS.md) D-012), and the fixture holds only 8 trades,
-> so candle output is sparse. Milestone 4 (cross-exchange alignment) is next.
+> **Project status: Milestone 4 implemented; its real-data output is empty.**
+> Ingestion, order book reconstruction, Spark aggregation into a Parquet lake,
+> and the cross-exchange divergence join with a net-of-costs honesty layer.
+> 111 tests pass. The divergence job runs clean and emits **zero rows**, because
+> the captured data has no cross-venue overlap — see "Cross-exchange divergence"
+> below and [`DECISIONS.md`](DECISIONS.md) D-021. **No empirical claim about
+> real divergence has been made or can be made from this data.**
+
+## Cross-exchange divergence
+
+Two venue streams aligned onto a shared event-time grid, then equi-joined on
+`(symbol, window_start)`. Aligning first is what makes differing update rates
+tractable — a raw event-to-event join either explodes combinatorially or needs
+an arbitrary "nearest match" tie-break that silently decides the answer.
+
+Clock skew sets the floor on window width: if venue clocks differ by more than
+the window, the same instant lands in different windows and the join compares
+mismatched pairs, silently, in a way that looks like real divergence. So every
+joined row carries the observed `skew_ms`, making the assumption checkable
+rather than merely asserted. A venue dropping out yields no row — the join is
+inner, because a "divergence" against a missing venue is an outage, and mixing
+the two would make outages indistinguishable from signal.
+
+### The honesty layer
+
+Every row carries `net_edge_bps`: gross divergence minus two taker fees minus
+the half-spread crossed on each venue. Using published retail fees and the
+spreads this pipeline actually measured:
+
+```
+26 bps (Kraken) + 40 bps (Binance.US) + 0.5 × (0.02 + 0.14) = 66.08 bps
+```
+
+**A divergence must exceed ~66 bps before a naive round trip breaks even.**
+Typical divergences on liquid pairs are a few bps. That gap is an order of
+magnitude, so a factor-of-two error in the fee assumptions changes nothing.
+
+And `survives_costs = true` is far weaker than it sounds — it means only that
+the most *favourable* accounting hasn't ruled a divergence out. Latency, queue
+position, inventory pre-positioning, displayed size and adverse selection all
+subtract further and none is modelled; they are enumerated in
+`xstream.analysis.economics.EXPLOITABILITY_CAVEATS` so the omissions are
+explicit.
+
+### What this project has not shown
+
+The job produces **no rows on the captured data**, for two independent reasons:
+Kraken traded only BTC-USD and Binance.US only ETH-USD (no shared symbol), and
+only Kraken's books are seedable (D-012), so every snapshot row is `kraken`. A
+cross-exchange detector needs two exchanges.
+
+Join semantics are tested against synthetic rows — correct for testing pair
+ordering, sign conventions and dropout handling, which are properties of the
+code rather than of the market. But **no real cross-venue divergence has been
+observed here**, so this project makes no empirical claim about divergence
+magnitude, frequency or duration. Closing that needs a Binance REST snapshot
+payload and a capture long enough to contain trades on a shared symbol.
 
 ## Stream processing
 

@@ -695,3 +695,125 @@ files landing every 10 seconds is already fast for an analytical layer.
 The trigger interval also controls the small-file problem. Ten seconds produces
 six file-sets per minute per partition combination, which is why Milestone 5
 needs a compaction job rather than treating it as optional polish.
+
+---
+
+## D-020: Align to a common event-time grid before joining, and measure the skew
+
+**Date:** 2026-08-11
+
+The cross-exchange join aggregates each venue into fixed event-time windows
+first, then equi-joins on `(symbol, window_start)`. It does not join raw event
+to raw event.
+
+**Different update frequencies force this.** The two venues emit at completely
+different rates — in the captured data Kraken produced 474 book messages and
+Binance.US 493, but distributed quite differently in time. A raw event-to-event
+join has no natural key: it either matches every event against every event in
+the tolerance interval, which explodes, or it picks a "nearest" match, which
+requires an arbitrary tie-break that silently decides the answer. Aligning to a
+grid makes "the price at time T" mean the same thing on both sides, and the
+join becomes an ordinary equi-join.
+
+**Clock skew sets the floor on window size.** Venue timestamps come from the
+venues' own clocks, which are not synchronized with each other. If skew exceeds
+the window width, the same market instant lands in different windows and the
+join compares mismatched pairs — silently, and in a way that looks like real
+divergence. The window must therefore be wider than the expected skew, which is
+an assumption, so every joined row carries the observed `skew_ms` between the
+two venues' last event times. The assumption is checkable in the output rather
+than merely asserted here.
+
+**A venue dropping out produces no row.** The join is inner. An outer join would
+emit rows with one side null, and a "divergence" measured against a missing
+venue is an outage, not a divergence — putting it in the same table would make
+outages indistinguishable from signal. Outage detection belongs in the
+Milestone 5 data-quality checks.
+
+The watermark is 30 seconds here rather than the 10 used by the single-venue
+jobs, because a stream-stream join must retain both sides' state until it can
+be certain no further match will arrive. That is a direct memory cost of the
+join and is the reason the watermark is not simply set generously large.
+
+---
+
+## D-021: Milestone 4 produces no real rows, and why that is the honest outcome
+
+**Date:** 2026-08-11
+**Status:** Implemented and tested; real-data output is empty pending data.
+
+The divergence job runs cleanly against the live broker, commits its batches,
+and emits **zero rows**. That is the correct result for the data available, and
+it is caused by two independent facts, either of which alone would be enough:
+
+1. **No overlapping symbol in trades.** Kraken's capture contains exactly one
+   trade, on BTC-USD. Binance.US's contains seven, all on ETH-USD. There is no
+   symbol on which both venues traded, so a trade-based join has nothing to
+   pair.
+2. **Only one venue produces book state.** Binance books cannot be seeded
+   without a REST snapshot from a blocked host (D-012), so they never reach
+   READY and the snapshotter correctly refuses to emit them. Verified against
+   the live topic: every snapshot row is `kraken`.
+
+A cross-*exchange* divergence detector needs two exchanges. With one, an inner
+join yields nothing, which is exactly what it should do.
+
+**What was verified anyway.** Join semantics are tested against synthetic rows,
+which is the right tool: pair ordering, sign conventions, dropout handling and
+threshold behaviour are properties of the code, not of the market. Eighteen
+tests cover them, including that non-overlapping symbols produce no rows — the
+fixture's exact situation, pinned deliberately so this stays a known condition
+rather than a mystery.
+
+**What was not verified, stated plainly.** No real cross-venue divergence has
+been observed, so this project has produced no empirical claim whatsoever about
+divergence magnitude, frequency or duration. Nothing in the README or
+`EVALUATION.md` may imply otherwise. Filling this in requires either a Binance
+REST snapshot payload to enable book seeding, or a capture long enough to
+contain trades on a shared symbol — most cheaply, both.
+
+---
+
+## D-022: The cost floor, and what "not exploitable" actually means
+
+**Date:** 2026-08-11
+
+Every joined row carries a `net_edge_bps` alongside its gross divergence:
+gross magnitude minus two taker fees minus the half-spread crossed on each
+venue. `survives_costs` is the boolean.
+
+**The arithmetic is stark.** Using published retail taker fees (Kraken ~26 bps,
+Binance.US ~40 bps) and the spreads actually measured in Milestone 3 (0.02 bps
+and 0.14 bps), breakeven is:
+
+```
+26 + 40 + 0.5 * (0.02 + 0.14) = 66.08 bps
+```
+
+A cross-venue divergence on a liquid pair must exceed **66 bps** before a naive
+round trip breaks even. Typical divergences on liquid instruments are a few
+bps. The gap is not marginal; it is an order of magnitude, which is why a
+factor-of-two error in the fee assumptions would not change the conclusion.
+
+**`survives_costs = true` is a much weaker statement than it appears.** It means
+only that the most basic and most *favourable* cost accounting has not ruled a
+divergence out. It does not mean profitable. Latency, queue position, inventory
+pre-positioning, displayed size and adverse selection all subtract further, and
+none is modelled — they are enumerated in
+`xstream.analysis.economics.EXPLOITABILITY_CAVEATS` so the omissions are
+explicit rather than implied. Maker rebates, slippage past the top level,
+withdrawal fees and taxes are likewise absent, and every one of them makes the
+picture worse.
+
+**Duration is computed in SQL, not in streaming state.** Assembling consecutive
+flagged windows into episodes is a gaps-and-islands problem; doing it in
+Structured Streaming means custom state that must stay correct across restarts
+and late data, for an output nobody consumes in real time. `queries/
+divergence_duration.sql` does it as a window function over the Parquet lake:
+re-runnable, inspectable, and cheap. Streaming detects; batch assembles.
+
+The framing this produces is the one worth defending in conversation: *the
+detector finds excursions, and the arithmetic says essentially none of them are
+tradeable.* That conclusion is more credible than a suspiciously profitable
+one, and it is the actual state of the world for retail participants on liquid
+venues.
