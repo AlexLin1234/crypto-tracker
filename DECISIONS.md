@@ -528,3 +528,170 @@ Milestone 6, which needs a long recording to replay at 10x and 100x, nor for
 observing a real gap or reconnect in the wild. Capturing it needs a machine
 with feed access and `scripts/recon/*.py --limit`, which already supports
 arbitrarily long captures.
+
+---
+
+## D-015: Watermark policy — 10 seconds, and what it costs
+
+**Date:** 2026-08-11
+
+Both streaming jobs use `withWatermark("event_time", "10 seconds")` on the
+**exchange** timestamp, never the ingest timestamp.
+
+A watermark is a decision about how wrong you are willing to be. Spark needs
+one to know when a window can be closed and its state evicted; without it,
+state for every window ever seen is retained forever and the job dies of memory
+exhaustion rather than of a bad answer. Choosing 10 seconds says: *an event
+more than 10 seconds late is dropped, and I accept a slightly wrong aggregate
+in exchange for bounded state.*
+
+Why 10 seconds specifically: the observed ingest latency on the captured data
+is sub-second, so 10 seconds is roughly an order of magnitude of headroom for a
+reconnect, a GC pause, or a burst of consumer lag. It is deliberately much
+larger than the 1s finest window, so a late event usually still lands in its own
+window rather than being discarded.
+
+**Windowing on event time is what makes this honest.** Using the ingest
+timestamp would guarantee no event is ever late — and would silently destroy the
+lateness and clock-skew measurements this project exists to make. The two
+timestamps are both carried from ingestion precisely so the difference stays
+visible.
+
+**The consequence that bit during verification:** in append mode a window is
+only emitted once the watermark passes its end, so the *tail* of a bounded
+replay never flushes. Replaying a finite fixture and then stopping leaves the
+final windows permanently in state. This is correct behaviour, not a bug: in a
+live stream event time keeps advancing and windows close continuously. It does
+mean that verifying against a fixture requires either more data after the
+windows of interest or a shortened watermark, and that is a property of the
+test, not of the pipeline.
+
+---
+
+## D-016: Realized volatility is a within-window price standard deviation
+
+**Date:** 2026-08-11
+
+`price_stddev` is the standard deviation of trade prices inside the window. It
+is **not** annualized and **not** a returns-based estimator.
+
+A proper realized volatility is computed from log returns, usually
+`sqrt(sum(r_i^2))` over the interval, and is scaled to a horizon. That needs
+consecutive trades ordered within the window, which in Spark means a windowed
+`lag`, which means either a second shuffle or an ordering guarantee the
+aggregation does not provide.
+
+The cruder estimator is used because it is cheap, it is well defined on the
+data actually available, and — most importantly — it is *labelled* as a proxy
+rather than presented as realized volatility. Milestone 7 must treat it as a
+dispersion feature, not as a volatility estimate, and any claim built on it
+inherits that caveat. It also returns null on a single-trade window, which is
+correct: dispersion is undefined on one observation, and a zero there would be
+a lie that a model would happily learn.
+
+---
+
+## D-017: Book features come from reconstructed state, not from raw deltas
+
+**Date:** 2026-08-11
+**This entry records a mistake and its correction.**
+
+The first version of the Milestone 3 book job read `orderbook.raw` in Spark and
+computed spread, mid-price and depth imbalance directly from the delta
+messages, taking the first element of each message's `bids`/`asks` array as top
+of book. The docstring justified it on the grounds that "Kraken sends the top 10
+levels on every update."
+
+**That premise is false.** Both venues send only the levels that *changed*. A
+delta's first bid is whatever level happened to move, which is usually not the
+best bid. Kraken updates in the capture routinely look like
+`{"bids": [], "asks": [{...}]}` — one side empty entirely.
+
+The output made the error obvious rather than subtle:
+
+| venue / symbol | avg spread | avg relative spread |
+| --- | --- | --- |
+| binance_us BTC-USD | **$216.09** | **35.0 bps** |
+| kraken BTC-USD | $0.10 | 0.02 bps |
+
+A 1,750x discrepancy between two liquid venues on the same instrument is not a
+market phenomenon. Had the number been merely plausible — say 3 bps against
+0.5 bps — it would likely have shipped, and Milestone 4's entire divergence
+analysis would have been built on a feature that does not mean what its name
+says.
+
+**The correction** was to put reconstruction in front of Spark rather than to
+patch the arithmetic. `xstream.orderbook.snapshotter` consumes `orderbook.raw`,
+applies deltas to real `OrderBook` instances — the same ones verified against
+474 checksums in Milestone 2 — and publishes derived top-of-book state to
+`orderbook.snapshots`. Spark reads that topic, where every row is already
+correct, and does what it is actually good at: windowing, watermarking,
+aggregation and partitioned columnar output.
+
+Reconstruction stays outside Spark deliberately. It is inherently sequential
+per (exchange, symbol), it depends on the checksum verification that only the
+Python implementation has, and moving it in would mean either a stateful
+`flatMapGroupsWithState` reimplementation or shipping book state through a
+shuffle. The split is a decision about where state belongs, not an omission.
+
+After the fix, over the same data: Kraken BTC-USD averages a $0.10 spread
+(0.02 bps) and ETH-USD $0.024 (0.14 bps), with zero crossed books, zero gaps
+and zero checksum failures across every emitted row.
+
+**The lesson worth keeping:** the bug was caught only because the wrong number
+was absurd. A quieter version of the same mistake would have survived. That is
+an argument for sanity-checking derived features against known market
+magnitudes as a routine step, not for trusting that plausible output is
+correct.
+
+---
+
+## D-018: Snapshots are sampled on event time, not wall-clock time
+
+**Date:** 2026-08-11
+
+The snapshotter emits a book snapshot every N milliseconds of **market** time,
+tracked per book from the venue timestamps, rather than every N milliseconds of
+wall-clock time.
+
+Wall-clock sampling makes a replay produce a different series than a live run.
+Forty seconds of captured market data is consumed in roughly two seconds, so a
+250 ms wall-clock timer fires a handful of times during ingest and then repeats
+a frozen, unchanging book indefinitely. The first implementation did exactly
+that, and the result was a single emitted window whose event timestamps were
+all identical.
+
+Event-time sampling yields one row per 250 ms of market time whether the source
+is a live socket or a file, which is both what a feature series should mean and
+what makes the replay deterministic — a prerequisite for the Milestone 6 load
+tests, which replay the same data at 10x and 100x and need the output to depend
+on the data rather than on how fast the machine happened to run.
+
+---
+
+## D-019: Where the shuffle is, and micro-batch vs continuous
+
+**Date:** 2026-08-11
+
+**The shuffle.** Each job has exactly one, at the `groupBy(window, exchange,
+symbol)`. Everything before it — JSON parsing, decimal casts, derived columns —
+is narrow and runs in the same task as the Kafka partition read. The shuffle
+width is `spark.sql.shuffle.partitions`, set to 8 rather than the default 200:
+with two symbols, 200 partitions means 200 mostly-empty tasks per batch, and
+task scheduling overhead dominates the actual work.
+
+That grouping key inherits the skew designed in at D-008. Messages are keyed by
+symbol in Kafka, so with two symbols only two Kafka partitions carry data, and
+the post-shuffle grouping likewise concentrates into few non-empty partitions.
+Milestone 6 measures it.
+
+**Micro-batch, not continuous processing.** Continuous processing offers
+millisecond end-to-end latency but supports only map-like operations — no
+aggregations, which is the entire job here. Micro-batch with a 10 second
+processing-time trigger is the right trade for a pipeline whose output is
+windowed candles: the trigger interval sets how often Parquet files land, and
+files landing every 10 seconds is already fast for an analytical layer.
+
+The trigger interval also controls the small-file problem. Ten seconds produces
+six file-sets per minute per partition combination, which is why Milestone 5
+needs a compaction job rather than treating it as optional polish.

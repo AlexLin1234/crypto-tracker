@@ -10,13 +10,41 @@ trading bot.** The prediction task in Milestone 7 exists as a vehicle for
 demonstrating evaluation rigor, not as a claim that anything here is
 profitable.
 
-> **Project status: Milestone 2 complete, with one documented gap.** Schemas
-> documented from real captures ([`docs/SCHEMAS.md`](docs/SCHEMAS.md));
-> ingestion service with per-venue connectors, normalization, Kafka-protocol
-> producer, reconnect and graceful shutdown; L2 order book reconstruction with
-> gap detection and resync. 83 tests pass. Binance book *seeding* needs a REST
-> snapshot that is unreachable here — see [`DECISIONS.md`](DECISIONS.md) D-012.
-> Milestone 3 (Spark aggregation) is next.
+> **Project status: Milestone 3 complete.** Ingestion, order book
+> reconstruction, and Spark Structured Streaming aggregation into a partitioned
+> Parquet lake queryable from DuckDB. 93 tests pass. Two documented gaps:
+> Binance book *seeding* needs an unreachable REST snapshot
+> ([`DECISIONS.md`](DECISIONS.md) D-012), and the fixture holds only 8 trades,
+> so candle output is sparse. Milestone 4 (cross-exchange alignment) is next.
+
+## Stream processing
+
+```
+orderbook.raw ──► snapshotter (stateful, checksum-verified) ──► orderbook.snapshots ──┐
+                                                                                       ├─► Spark ─► Parquet ─► DuckDB
+trades.raw ───────────────────────────────────────────────────────────────────────────┘
+```
+
+Reconstruction sits **in front of** Spark, not inside it. The first version
+derived spread and imbalance from raw deltas in Spark and was wrong: both
+venues send only *changed* levels, so a delta's first bid is an arbitrary moved
+level, not the best bid. The output said so loudly — Binance BTC-USD averaged a
+**$216 spread** against Kraken's **$0.10**. A 1,750x gap between two liquid
+venues is not a market phenomenon.
+
+Had it been merely plausible — 3 bps against 0.5 bps — it would have shipped,
+and the Milestone 4 divergence analysis would have rested on a feature that
+does not mean what its name says. The full writeup is
+[`DECISIONS.md`](DECISIONS.md) D-017.
+
+After the fix, Kraken BTC-USD averages a $0.10 spread (0.02 bps) and ETH-USD
+$0.024 (0.14 bps), with zero crossed books, zero gaps and zero checksum
+failures across every emitted row.
+
+Other decisions worth reading: the watermark policy and what it drops (D-015),
+why realized volatility is deliberately a labelled proxy (D-016), event-time
+rather than wall-clock sampling so replay is deterministic (D-018), and where
+the single shuffle lives (D-019).
 
 ## Order book reconstruction
 
@@ -103,6 +131,27 @@ Kafka-compatible broker works. Point `--brokers` at whatever is running.
 
 Omit `--brokers` to normalize and count messages without producing — useful for
 checking a feed without standing up infrastructure.
+
+### Processing
+
+```bash
+# reconstruct books and publish top-of-book snapshots
+uv run python -m xstream.orderbook.snapshotter --brokers localhost:19092
+
+# windowed aggregates -> Parquet
+uv run python -m xstream.processing.trades_job --brokers localhost:19092
+uv run python -m xstream.processing.book_job   --brokers localhost:19092
+```
+
+Output lands in `data/lake/{candles_1s,candles_10s,candles_1m,book_features}`,
+partitioned `date/hour/exchange/symbol` — coarsest first, so a time-bounded
+query prunes whole directories before opening a file. Query it directly:
+
+```sql
+SELECT exchange, symbol, avg(spread), avg(book_imbalance)
+FROM read_parquet('data/lake/book_features/**/*.parquet', hive_partitioning=true)
+GROUP BY 1, 2;
+```
 
 ### Replay without a live connection
 

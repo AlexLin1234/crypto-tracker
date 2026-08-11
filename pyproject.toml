@@ -14,16 +14,13 @@ dependencies = [
     "confluent-kafka>=2.15.0",
     "structlog>=26.1.0",
     "sortedcontainers>=2.4.0",
+    "pyspark>=4.0",
+    "pyarrow>=24.0.0",
+    "duckdb>=1.5.5",
+    "pandas>=2.2,<3",
 ]
 
 [project.optional-dependencies]
-# Milestones 3-5: Spark, Parquet, DuckDB
-processing = [
-    "pyspark>=3.5",
-    "pyarrow>=16.0",
-    "duckdb>=1.0",
-    "pandas>=2.2",
-]
 # Milestone 7: modelling
 ml = [
     "scikit-learn>=1.5",

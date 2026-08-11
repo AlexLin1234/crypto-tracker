@@ -22,3 +22,8 @@ recordings/
 .DS_Store
 .idea/
 .vscode/
+
+# Spark
+spark-warehouse/
+derby.log
+metastore_db/
