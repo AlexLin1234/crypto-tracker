@@ -817,3 +817,126 @@ detector finds excursions, and the arithmetic says essentially none of them are
 tradeable.* That conclusion is more credible than a suspiciously profitable
 one, and it is the actual state of the world for retail participants on liquid
 venues.
+
+---
+
+## D-023: Spark decimal precision loss corrupted VWAP — caught by a sanity check
+
+**Date:** 2026-08-11
+**This entry records a real correctness bug found in Milestone 3's output.**
+
+`queries/06_vwap_vs_close.sql` includes a column that should always be zero:
+the count of rows where VWAP falls outside its own window's high-low range.
+That is arithmetically impossible for a correct volume-weighted average — VWAP
+is a weighted mean of prices inside the window, so it cannot exceed the highest
+or fall below the lowest.
+
+It came back as **1**.
+
+**The cause.** Spark caps decimal precision at 38 digits. When an operation
+needs more, it preserves precision and sacrifices *scale*, down to a floor of
+six decimals. Multiplying two `DECIMAL(38,18)` values needs precision 77, so
+Spark silently rescales the product to `DECIMAL(38,6)`. A crypto quantity of
+`0.00009417` therefore became `0.000094` — three significant figures gone —
+and both `volume` and `notional` were rounded before the division that produces
+VWAP. The result was `63348.401826` on a window whose only trade printed at
+`63348.4`.
+
+Python's `Decimal` computes `(63348.4 × 0.00009417) / 0.00009417` as exactly
+`63348.4`. The loss was entirely Spark's, and entirely silent.
+
+**The fix** is `DECIMAL(20,8)` rather than `DECIMAL(38,18)`. Eight decimals is
+what both venues actually send, and the product of two `DECIMAL(20,8)` values
+lands at `DECIMAL(38,13)` — inside the cap, with scale to spare. After the fix
+VWAP equals the trade price exactly and the impossible-row count is zero.
+
+**The uncomfortable part.** Milestone 3 shipped with this bug. Every test
+passed, because the tests compared VWAP against expected values computed on
+inputs whose scale happened not to trigger the rescale. The bug only surfaced
+when a query asserted an *invariant* — "VWAP lies within [low, high]" — rather
+than a value. That is the transferable lesson: invariant checks catch classes
+of error that example-based tests structurally cannot, and a bigger decimal
+type is not automatically a safer one.
+
+---
+
+## D-024: Ingest latency is meaningless on replayed data, and says so
+
+**Date:** 2026-08-11
+
+`ingest_latency_ms` is the gap between the venue's timestamp and ours. On a
+live feed that is genuine end-to-end latency. On a **replayed fixture** it is
+the age of the fixture: the capture is from 2026-08-02, the replay ran on
+2026-08-11, and the query duly reported a p50 latency of roughly 808,500,000 ms
+— about nine days.
+
+The number is arithmetically correct and analytically worthless, which is the
+dangerous combination. `queries/03_ingest_latency_percentiles.sql` therefore
+emits a `measurement_valid` column that reads
+`NO - replayed fixture, not live ingest` whenever the maximum exceeds a minute,
+since nothing plausibly attributable to network latency lasts that long.
+
+The consequence for Milestone 6 is concrete: **latency percentiles cannot be
+benchmarked from replayed data.** Throughput can — replay is exactly the right
+tool for load testing — but the latency column of `BENCHMARKS.md` needs a live
+connection, and any figure published without one would be measuring the wrong
+thing.
+
+---
+
+## D-025: Compaction only touches closed partitions, and never deletes first
+
+**Date:** 2026-08-11
+
+Compaction merges a partition's small files into one and **deletes the
+originals**, so its failure mode is permanent data loss rather than a bad
+query. Two rules contain that risk.
+
+**Only closed partitions.** A streaming query may still be appending to the
+current hour, and rewriting a partition underneath a live writer races it.
+Partitions are compacted only once their event-time hour is strictly in the
+past, which is decidable from the partition path alone without coordinating
+with the writer. "No file has appeared recently" is explicitly *not* accepted
+as evidence a partition is finished.
+
+**Write, then swap, then delete.** The merged output goes to a temporary file,
+is moved into place, and only then are the inputs removed. An interruption at
+any point leaves either the originals or both copies — never a partition with
+neither.
+
+Measured on the current lake: 9 files and 48,146 bytes became 2 files and
+9,267 bytes, **80.8% smaller**, with row counts and values verified identical
+before and after. The saving is mostly Parquet footer and row-group overhead,
+which is exactly the cost the small-file problem imposes.
+
+The lake still averages ~5 KB per file against a target in the hundreds of
+megabytes. That gap is a property of the tiny fixture, not of the compactor,
+and it will close on its own as soon as there is real volume to compact.
+
+---
+
+## D-026: Outliers are measured against the median, not the mean
+
+**Date:** 2026-08-11
+
+The outlier check uses an Iglewicz-Hoaglin modified z-score — deviation from
+the median, scaled by median absolute deviation — rather than the obvious
+mean-and-standard-deviation z-score.
+
+The obvious version does not work, and a test proved it rather than an
+argument. Thirty identical prices plus one grossly wrong one failed to trip a
+six-sigma threshold, because **an outlier inflates the standard deviation it is
+being judged against**. For a population standard deviation the largest
+attainable z-score is bounded by `(n-1)/sqrt(n)`; with 31 observations that
+ceiling is about 5.48, so no single value could ever reach six sigma regardless
+of how wrong it was. A detector that cannot fire is worse than no detector,
+because it reads as reassurance.
+
+MAD has roughly a 50% breakdown point, so one bad print barely moves it. But
+MAD alone is not sufficient either: it collapses to zero whenever more than
+half the values are identical, which is exactly what a quiet book quoting the
+same mid repeatedly looks like. A `WHERE mad > 0` guard would then report "no
+outliers" on precisely the case of interest — the second way this check nearly
+shipped broken. The prescribed fallback to mean absolute deviation, scaled by
+1.253314, handles it, and only a perfectly constant series now yields no
+outliers, which is correct.

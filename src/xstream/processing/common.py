@@ -31,7 +31,23 @@ from pyspark.sql.types import (
 #: fails at query start with an unhelpful message.
 KAFKA_PACKAGE = "org.apache.spark:spark-sql-kafka-0-10_2.13:{version}"
 
-PRICE_TYPE = "DECIMAL(38,18)"
+#: DECIMAL(20,8), deliberately *not* DECIMAL(38,18).
+#:
+#: Spark caps decimal precision at 38. When an operation needs more, it keeps
+#: the precision and sacrifices *scale*, down to a floor of 6. Multiplying two
+#: DECIMAL(38,18) values needs precision 77, so the result is silently rescaled
+#: to DECIMAL(38,6) -- and a crypto quantity like 0.00009417 becomes 0.000094,
+#: losing three significant figures before anything downstream can notice.
+#:
+#: This was caught by the VWAP sanity check in queries/06_vwap_vs_close.sql,
+#: which found a VWAP outside its window's high-low range: arithmetically
+#: impossible, and only possible here because volume and notional had each been
+#: rounded to 6 decimals. See D-023.
+#:
+#: 8 decimals matches what both venues actually send, and the product of two
+#: DECIMAL(20,8) values lands at DECIMAL(38,13) -- comfortably inside the cap,
+#: with scale to spare.
+PRICE_TYPE = "DECIMAL(20,8)"
 
 TRADE_SCHEMA = StructType(
     [

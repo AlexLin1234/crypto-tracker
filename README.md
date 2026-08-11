@@ -10,7 +10,50 @@ trading bot.** The prediction task in Milestone 7 exists as a vehicle for
 demonstrating evaluation rigor, not as a claim that anything here is
 profitable.
 
-> **Project status: Milestone 4 implemented; its real-data output is empty.**
+> **Project status: Milestone 5 complete.** Ingestion, order book
+> reconstruction, Spark aggregation, cross-exchange divergence, and a DuckDB
+> analytical layer with compaction, data-quality checks and a one-command
+> report. 130 tests pass. Milestone 6 (benchmarks) is next.
+
+## Storage and analytics
+
+```bash
+uv run python -m xstream.analysis.report        # inventory + quality + 9 queries
+uv run python -m xstream.analysis.compaction    # merge small files
+```
+
+DuckDB reads the Parquet directly, so the lake *is* the database — no load
+step, no second copy. Compaction merged the current lake from 9 files to 2,
+**80.8% smaller**, with row counts and values verified identical either side.
+It only touches partitions whose event-time hour is strictly past, since a
+streaming writer may still be appending to the current one, and it writes-then-
+swaps-then-deletes so an interruption never leaves a partition with neither
+copy.
+
+### A sanity check caught a real bug
+
+`queries/06_vwap_vs_close.sql` counts rows where VWAP falls outside its own
+window's high-low range — arithmetically impossible for a correct
+volume-weighted average. It returned **1**.
+
+Spark caps decimal precision at 38 digits, and when an operation needs more it
+keeps precision and sacrifices *scale*, down to a floor of six decimals.
+Multiplying two `DECIMAL(38,18)` values needs precision 77, so the product was
+silently rescaled to `DECIMAL(38,6)` — turning a quantity of `0.00009417` into
+`0.000094` before the division that produces VWAP.
+
+Milestone 3 shipped with this. Every unit test passed, because they compared
+VWAP against expected values on inputs that happened not to trigger the
+rescale. Only an *invariant* check found it. Fixed by using `DECIMAL(20,8)`,
+whose products land at `DECIMAL(38,13)`; full writeup in
+[`DECISIONS.md`](DECISIONS.md) D-023.
+
+Two related notes: outliers are measured in median-absolute-deviation units
+because an outlier inflates the standard deviation it would be judged against
+(D-026), and ingest latency is explicitly flagged invalid on replayed data,
+where it measures fixture age rather than network latency (D-024).
+
+> **Milestone 4 note: its real-data output is empty.**
 > Ingestion, order book reconstruction, Spark aggregation into a Parquet lake,
 > and the cross-exchange divergence join with a net-of-costs honesty layer.
 > 111 tests pass. The divergence job runs clean and emits **zero rows**, because
