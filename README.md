@@ -6,19 +6,150 @@ microstructure features, and detects cross-exchange price divergences — with a
 deliberately self-skeptical evaluation layer.
 
 **This is streaming data infrastructure and feature engineering. It is not a
-trading bot.** The prediction task in Milestone 7 exists as a vehicle for
-demonstrating evaluation rigor, not as a claim that anything here is
-profitable.
+trading bot.** The prediction task exists to demonstrate evaluation rigor, not
+to claim anything here is profitable. The honest conclusion about
+cross-exchange divergence — worked out in arithmetic, not vibes — is that
+essentially none of it is exploitable after costs.
 
-> **Project status: Milestone 6 complete.** Ingestion, order book
-> reconstruction, Spark aggregation, cross-exchange divergence, and a DuckDB
-> analytical layer with compaction, data-quality checks and a one-command
-> report, and measured benchmarks. 142 tests pass. Milestone 7 (prediction +
-> evaluation rigor) is next.
+> **Status:** all nine milestones implemented; **159 tests pass**. Two data
+> gaps mean parts of the pipeline run correctly while producing empty output.
+> Those gaps are documented rather than papered over — see
+> [Honest limitations](#honest-limitations) and [`RUNBOOK.md`](RUNBOOK.md) for
+> exactly what is needed to get real numbers flowing.
+
+---
+
+## Architecture
+
+```mermaid
+flowchart LR
+  subgraph venues[Exchanges]
+    K[Kraken v2<br/>CRC32 checksum]
+    B[Binance.US<br/>U/u sequence IDs]
+  end
+
+  subgraph ingest[Ingestion · asyncio]
+    C[Connectors<br/>normalize to one schema<br/>Decimal prices<br/>dual timestamps]
+  end
+
+  subgraph broker[Redpanda / Kafka API]
+    T[trades.raw]
+    O[orderbook.raw]
+    S[orderbook.snapshots]
+    D[divergence.events]
+  end
+
+  subgraph state[Stateful reconstruction]
+    BK[OrderBook<br/>gap detect + resync<br/>checksum verified]
+  end
+
+  subgraph spark[Spark Structured Streaming]
+    TJ[trades job<br/>OHLCV · VWAP · imbalance]
+    BJ[book job<br/>spread · depth · imbalance]
+    DJ[divergence job<br/>cross-venue join<br/>+ cost floor]
+  end
+
+  L[(Parquet lake<br/>date/hour/exchange/symbol)]
+  Q[DuckDB<br/>queries · quality · report]
+  M[Model<br/>walk-forward + lookahead audit]
+
+  K --> C --> T & O
+  B --> C
+  O --> BK --> S
+  T --> TJ --> L
+  S --> BJ --> L
+  S --> DJ --> L
+  DJ --> D
+  L --> Q --> M
+```
+
+Two design choices are worth pulling out of that diagram.
+
+**Reconstruction sits in front of Spark, not inside it.** Both venues send only
+*changed* levels, so top-of-book is only knowable from reconstructed state. The
+first version computed spread in Spark from raw deltas and was wrong by a
+factor of 1,750 (D-017).
+
+**The two venues verify integrity differently** — Kraken by checksum, Binance
+by sequence number — so the book layer abstracts over both rather than
+pretending they are the same thing (D-004).
+
+---
+
+## Quickstart
+
+```bash
+uv sync
+docker compose up -d              # Redpanda + Console
+./scripts/create_topics.sh
+
+# ingestion, one process per venue
+uv run python -m xstream.ingest --exchange kraken     --brokers localhost:19092
+uv run python -m xstream.ingest --exchange binance_us --brokers localhost:19092
+
+# stateful reconstruction, then Spark
+uv run python -m xstream.orderbook.snapshotter   --brokers localhost:19092
+uv run python -m xstream.processing.trades_job   --brokers localhost:19092
+uv run python -m xstream.processing.book_job     --brokers localhost:19092
+uv run python -m xstream.processing.divergence_job --brokers localhost:19092
+
+# analytics
+uv run python -m xstream.analysis.report          # inventory + quality + 9 queries
+uv run streamlit run dashboard/app.py             # dashboard on :8501
+```
+
+No exchange access? The captured fixtures replay through the identical
+connector, normalizer and sink:
+
+```bash
+uv run python -m xstream.ingest.replay --brokers localhost:19092
+```
+
+Redpanda is not required — anything speaking the Kafka protocol works. This
+project's own verification ran against Apache Kafka in KRaft mode.
+
+---
+
+## Design decisions
+
+Full log in [`DECISIONS.md`](DECISIONS.md) (31 entries). The ones that shaped
+the most code:
+
+| | |
+| --- | --- |
+| **Why Redpanda** | Single binary, no ZooKeeper/KRaft ceremony, starts in seconds — keeps the five-minute quickstart honest. Protocol-identical to Kafka, so migration is a broker address change (D-007). |
+| **Why these two venues** | Chosen on evidence, not the original plan. Coinbase's L2 feed carries **no sequence number and no checksum**, so a dropped update cannot be detected at all — which would have gutted Milestone 2 (D-004, D-005). |
+| **Partition by symbol** | Preserves per-venue ordering and gives the cross-exchange join partition locality, at the cost of deliberate skew: 73.1% of messages land in one partition (D-008, D-029). |
+| **Decimal, not float** | Kraken sends prices as JSON *numbers*; `json.loads` destroys precision before application code sees it. Books key on exact price equality, so a float one ULP off is a different level (D-003). |
+| **Watermark = 10s** | A watermark is a decision about how wrong you are willing to be. Event-time windowing keeps lateness and clock skew measurable instead of hiding them (D-015). |
+| **At-least-once** | Duplicates are detectable from venue sequence numbers and trade IDs; dropped messages are not. Exactly-once was not worth its cost (D-009). |
+| **Stop on integrity loss** | A book that keeps serving after detected corruption feeds plausible wrong numbers to everything downstream (D-013). |
+
+### Three bugs the design caught
+
+Worth reading in full, because each one nearly shipped:
+
+1. **VWAP outside its own high–low range** (D-023). Spark caps decimal
+   precision at 38 digits and sacrifices *scale* to stay there, silently
+   rescaling `DECIMAL(38,18)` products to 6 decimals — turning a quantity of
+   `0.00009417` into `0.000094`. Every unit test passed. Only an *invariant*
+   check found it.
+2. **An outlier detector that could not fire** (D-026). A z-score threshold of
+   6σ is unreachable at n=31, because an outlier inflates the standard
+   deviation it is judged against. Then the MAD replacement collapsed to zero
+   on a near-constant series. Both fixed.
+3. **A lookahead audit that could not fire** (D-031). It perturbed rows that
+   `build_features` drops, so the corruption never reached the output and it
+   reported "clean" for a deliberately planted leak.
+
+The pattern: *a detector that cannot fire is worse than none, because it reads
+as reassurance.*
+
+---
 
 ## Benchmarks
 
-Full numbers in [`BENCHMARKS.md`](BENCHMARKS.md). The headline:
+Full numbers in [`BENCHMARKS.md`](BENCHMARKS.md).
 
 | | |
 | --- | --- |
@@ -27,331 +158,166 @@ Full numbers in [`BENCHMARKS.md`](BENCHMARKS.md). The headline:
 | Consumer drain | 44,045 msg/s |
 | Cost of `Decimal` correctness | **1.62x** slower parsing |
 | Cost of checksum correctness | **8.4x** slower book updates |
-| Latency percentiles | **not measured — replay makes them meaningless** |
+| Latency percentiles | **not measured** — replay makes them meaningless |
 
 The pipeline is **CPU-bound in its stateful stage, not I/O-bound at the
-broker** — the broker sustains ~17x the pipeline's own ceiling, so adding
-brokers buys nothing until books are sharded by (exchange, symbol).
+broker**: the broker sustains ~17x the pipeline's own ceiling, so adding
+brokers buys nothing until books are sharded by `(exchange, symbol)`.
 
-Checksum verification is 88% of the bottleneck stage and stays on anyway: an
-unverified book is the silent-corruption failure the design exists to prevent,
-and 34k deltas/s is still ~1,500x the fixture's real-time rate.
+Checksum verification is 88% of the bottleneck stage and stays on regardless —
+34k deltas/s is still ~1,500x the fixture's real-time rate, and an unverified
+book is the failure the whole design exists to prevent.
 
-Two induced failures worth knowing. **Backpressure never fires at default
-settings** but collapses throughput 625x (579,260 → 926 msg/s) when the queue
-is undersized — with no errors logged, so the symptom looks nothing like the
-cause. And the symbol-keyed **partition skew designed in at D-008** puts 73.1%
-of messages in one partition and leaves 4 of 6 empty, which caps consumer-group
-parallelism at 2.
+**Induced failures.** Backpressure never fires at default settings, then
+collapses throughput **625x** (579,260 → 926 msg/s) when the queue is
+undersized — with nothing logged, so the symptom looks nothing like the cause.
 
-## Storage and analytics
+---
 
-```bash
-uv run python -m xstream.analysis.report        # inventory + quality + 9 queries
-uv run python -m xstream.analysis.compaction    # merge small files
-```
+## Cross-exchange divergence, and why it is not an opportunity
 
-DuckDB reads the Parquet directly, so the lake *is* the database — no load
-step, no second copy. Compaction merged the current lake from 9 files to 2,
-**80.8% smaller**, with row counts and values verified identical either side.
-It only touches partitions whose event-time hour is strictly past, since a
-streaming writer may still be appending to the current one, and it writes-then-
-swaps-then-deletes so an interruption never leaves a partition with neither
-copy.
-
-### A sanity check caught a real bug
-
-`queries/06_vwap_vs_close.sql` counts rows where VWAP falls outside its own
-window's high-low range — arithmetically impossible for a correct
-volume-weighted average. It returned **1**.
-
-Spark caps decimal precision at 38 digits, and when an operation needs more it
-keeps precision and sacrifices *scale*, down to a floor of six decimals.
-Multiplying two `DECIMAL(38,18)` values needs precision 77, so the product was
-silently rescaled to `DECIMAL(38,6)` — turning a quantity of `0.00009417` into
-`0.000094` before the division that produces VWAP.
-
-Milestone 3 shipped with this. Every unit test passed, because they compared
-VWAP against expected values on inputs that happened not to trigger the
-rescale. Only an *invariant* check found it. Fixed by using `DECIMAL(20,8)`,
-whose products land at `DECIMAL(38,13)`; full writeup in
-[`DECISIONS.md`](DECISIONS.md) D-023.
-
-Two related notes: outliers are measured in median-absolute-deviation units
-because an outlier inflates the standard deviation it would be judged against
-(D-026), and ingest latency is explicitly flagged invalid on replayed data,
-where it measures fixture age rather than network latency (D-024).
-
-## Cross-exchange divergence
-
-> **This section's job runs clean and produces zero rows on the captured data**,
-> because it has no cross-venue overlap. **No empirical claim about real
-> divergence has been made or can be made from this data** — see "What this
-> project has not shown" below and [`DECISIONS.md`](DECISIONS.md) D-021.
-
-Two venue streams aligned onto a shared event-time grid, then equi-joined on
-`(symbol, window_start)`. Aligning first is what makes differing update rates
-tractable — a raw event-to-event join either explodes combinatorially or needs
-an arbitrary "nearest match" tie-break that silently decides the answer.
-
-Clock skew sets the floor on window width: if venue clocks differ by more than
-the window, the same instant lands in different windows and the join compares
-mismatched pairs, silently, in a way that looks like real divergence. So every
-joined row carries the observed `skew_ms`, making the assumption checkable
-rather than merely asserted. A venue dropping out yields no row — the join is
-inner, because a "divergence" against a missing venue is an outage, and mixing
-the two would make outages indistinguishable from signal.
-
-### The honesty layer
-
-Every row carries `net_edge_bps`: gross divergence minus two taker fees minus
-the half-spread crossed on each venue. Using published retail fees and the
-spreads this pipeline actually measured:
+Every joined row carries `net_edge_bps`: gross divergence minus two taker fees
+minus the half-spread crossed on each venue. Using published retail fees and
+the spreads this pipeline measured:
 
 ```
 26 bps (Kraken) + 40 bps (Binance.US) + 0.5 × (0.02 + 0.14) = 66.08 bps
 ```
 
 **A divergence must exceed ~66 bps before a naive round trip breaks even.**
-Typical divergences on liquid pairs are a few bps. That gap is an order of
-magnitude, so a factor-of-two error in the fee assumptions changes nothing.
+Typical liquid-pair divergences are a few bps — an order of magnitude short, so
+a factor-of-two error in the fee assumptions changes nothing.
 
-And `survives_costs = true` is far weaker than it sounds — it means only that
-the most *favourable* accounting hasn't ruled a divergence out. Latency, queue
+And `survives_costs = true` is far weaker than it sounds: it means only that
+the most *favourable* accounting has not ruled a divergence out. Latency, queue
 position, inventory pre-positioning, displayed size and adverse selection all
-subtract further and none is modelled; they are enumerated in
+subtract further and none is modelled — enumerated in
 `xstream.analysis.economics.EXPLOITABILITY_CAVEATS` so the omissions are
-explicit.
+explicit rather than implied.
 
-### What this project has not shown
+---
 
-The job produces **no rows on the captured data**, for two independent reasons:
-Kraken traded only BTC-USD and Binance.US only ETH-USD (no shared symbol), and
-only Kraken's books are seedable (D-012), so every snapshot row is `kraken`. A
-cross-exchange detector needs two exchanges.
+## Evaluation
 
-Join semantics are tested against synthetic rows — correct for testing pair
-ordering, sign conventions and dropout handling, which are properties of the
-code rather than of the market. But **no real cross-venue divergence has been
-observed here**, so this project makes no empirical claim about divergence
-magnitude, frequency or duration. Closing that needs a Binance REST snapshot
-payload and a capture long enough to contain trades on a shared symbol.
+See [`EVALUATION.md`](EVALUATION.md). The harness refuses to report metrics
+below 500 usable rows, and on the current lake it refuses — one usable row.
 
-## Stream processing
+It is validated against synthetic data where the answer is known:
 
-```
-orderbook.raw ──► snapshotter (stateful, checksum-verified) ──► orderbook.snapshots ──┐
-                                                                                       ├─► Spark ─► Parquet ─► DuckDB
-trades.raw ───────────────────────────────────────────────────────────────────────────┘
-```
+| scenario | mean lift | verdict |
+| --- | ---: | --- |
+| Random walk | **−0.0394** | NO SIGNAL (model loses to always-down) |
+| Planted signal | **+0.3800** | SIGNAL DETECTED |
 
-Reconstruction sits **in front of** Spark, not inside it. The first version
-derived spread and imbalance from raw deltas in Spark and was wrong: both
-venues send only *changed* levels, so a delta's first bid is an arbitrary moved
-level, not the best bid. The output said so loudly — Binance BTC-USD averaged a
-**$216 spread** against Kraken's **$0.10**. A 1,750x gap between two liquid
-venues is not a market phenomenon.
+A harness that only ever says "no signal" is indistinguishable from a broken
+one, so it has to be shown capable of finding signal that is genuinely there.
 
-Had it been merely plausible — 3 bps against 0.5 bps — it would have shipped,
-and the Milestone 4 divergence analysis would have rested on a feature that
-does not mean what its name says. The full writeup is
-[`DECISIONS.md`](DECISIONS.md) D-017.
+---
 
-After the fix, Kraken BTC-USD averages a $0.10 spread (0.02 bps) and ETH-USD
-$0.024 (0.14 bps), with zero crossed books, zero gaps and zero checksum
-failures across every emitted row.
+## What I would change at production scale
 
-Other decisions worth reading: the watermark policy and what it drops (D-015),
-why realized volatility is deliberately a labelled proxy (D-016), event-time
-rather than wall-clock sampling so replay is deterministic (D-018), and where
-the single shuffle lives (D-019).
+**Managed Kafka and partition scaling.** Redpanda-in-Docker is a development
+convenience. Production wants MSK or Confluent Cloud for multi-AZ replication
+and someone else's pager. Because the choice was made on the *protocol*, that
+migration is a broker address change. Partition count is the harder problem: it
+cannot be reduced, and increasing it remaps keys and breaks per-key ordering,
+so it must be sized for the symbol count you expect rather than the one you
+have. Today 4 of 6 partitions sit empty (D-029).
 
-## Order book reconstruction
+**Exactly-once vs at-least-once.** This pipeline is deliberately at-least-once
+(D-009), because market data carries its own dedup keys — venue sequence
+numbers and trade IDs — so duplicates are detectable downstream while dropped
+messages are not recoverable. At production scale I would keep that choice and
+make the dedup explicit: idempotent book application (already true) and
+aggregation keyed on `(exchange, symbol, trade_id)`.
 
-The stateful core, and the part most likely to be subtly wrong — so it is
-verified against the venue's own integrity mechanism rather than against my
-expectations.
+**Handling skew.** The symbol-keyed partitioning that gives the divergence join
+its locality also caps consumer-group parallelism at the number of symbols with
+traffic. With two symbols that ceiling is 2 consumers, ~88k msg/s. More symbols
+spreads keys naturally and costs nothing; a composite `(exchange, symbol)` key
+doubles parallelism but splits the join. That is the trade to revisit first,
+and only when symbol count alone is not enough.
 
-**Replaying the captured Kraken session reproduces all 474 checksums with zero
-mismatches** — one snapshot plus 472 incremental updates, with the CRC32
-recomputed and compared after every single one. That single result verifies two
-things simultaneously: that the checksum algorithm (derived empirically, since
-Kraken's docs are unreachable — D-011) is correct, and that the book
-reconstruction is correct. They cannot both be wrong in a way that agrees 474
-consecutive times.
+**Schema registry.** Messages are JSON with schemas defined in Python
+dataclasses. That is fine for one producer and one consumer team, and it is not
+fine at scale: nothing prevents a producer change from silently breaking a
+consumer. Avro or Protobuf behind a schema registry, with compatibility
+enforced at publish time, replaces the `schema_drift` data-quality check with a
+guarantee. JSON also costs bandwidth — 7.9 µs/message just to encode.
 
-The two venues fail differently, so they are detected differently:
+**Cost.** The dominant costs would be broker storage and Spark compute, both
+driven by retention and window granularity. 1-second candles across many
+symbols is a lot of rows for questions usually asked at minute resolution; I
+would keep 1s only for a short retention window and roll up beyond it. The
+small-file problem is a real cost multiplier too — compaction cut this lake
+80.8% (D-025), and object-store request pricing punishes many small files
+harder than local disk does.
 
-| | Kraken | Binance.US |
-| --- | --- | --- |
-| Mechanism | CRC32 over top-10 state | `U`/`u` update IDs |
-| Says | "your book is wrong" | "you missed messages" |
-| Checked | **after** applying | **before** applying |
+**Monitoring and alerting.** The counters exist (`gap_count`,
+`checksum_failures`, reconnects, consumer lag) but nothing consumes them.
+Production needs them on a dashboard with alerts on: consumer lag trending up,
+any non-zero checksum failure rate, a book stuck STALE, ingest latency p99
+crossing the watermark (because that is when data starts being dropped rather
+than merely late), and Spark batch duration exceeding the trigger interval.
+The backpressure cliff (D-028) argues specifically for alerting on producer
+queue depth, since its symptom is silent.
 
-Sequence gaps are checked before mutating, so a detected gap leaves the last
-known-good book intact. Checksums describe the resulting state, so they can
-only be verified after. Both are tested.
+**Backfill.** Reprocessing from `earliest` works today because retention is
+short and volume is tiny. At scale, backfill needs to be a separate job writing
+to a separate output path, then an atomic swap — not a rerun of the streaming
+job with a wiped checkpoint, which competes with live processing for the same
+partitions. Event-time partitioning already makes a bounded backfill possible:
+a re-run for one day touches one day's directories.
 
-On any detected loss the book goes **STALE and stops** — it does not patch or
-interpolate. A book that keeps serving after known corruption is worse than one
-that halts, because every downstream consumer would get plausible numbers with
-no signal they are wrong (D-013).
+---
 
-## Exchanges
+## Honest limitations
 
-**Kraken v2 + Binance.US.** The original plan expected Kraken + Coinbase, since
-both are public and no-auth — a prior that held, as all three venues connected
-cleanly. The choice turned on something reconnaissance had to discover:
-Coinbase's L2 feed carries **no sequence number and no checksum**, so a dropped
-book update cannot be detected at all. Kraken carries a CRC32 checksum and
-Binance.US carries sequence IDs, which means order book gap detection — the
-defining requirement of Milestone 2 — can be built and tested on both venues
-rather than one.
+**What does not work yet, and why:**
 
-The two venues also verify integrity in genuinely different ways, so the order
-book layer has to abstract over checksum-based verification *and*
-sequence-based gap detection. Full reasoning, including what this costs
-(Binance.US is a thin venue, which will colour the divergence analysis), is in
-[`DECISIONS.md`](DECISIONS.md) D-004 and D-005.
+- **Binance books are never seeded.** The `@depth` stream is diffs only;
+  seeding needs a REST snapshot from `/api/v3/depth`, which was unreachable
+  from the development environment. That path was deliberately *not* written
+  against a guessed schema (D-012).
+- **Divergence output is empty.** Two independent causes: only one venue
+  produces book state, and the two venues traded different symbols in the
+  capture. The job is correct; it has one side of a two-sided join (D-021).
+- **No latency measurements.** On replayed fixtures the venue-to-ingest gap is
+  the *age of the capture* — the pipeline reported a p50 of about nine days.
+  Arithmetically correct, analytically worthless (D-024, D-030).
+- **No real prediction result.** One usable feature row (D-021, EVALUATION.md).
+- **The fixture is 40 seconds of quiet market.** Enough for correctness — it
+  drove 474 checksum verifications — and nowhere near enough for claims about
+  market behaviour, volatility regimes, or load beyond a single burst.
+- **No demo GIF.** Requires a live pipeline and screen capture, neither
+  available in the environment this was built in.
 
-## Planned architecture
+**What would break at 100x:** the book stage first, at ~34k deltas/s per
+process, because it is single-threaded and sequential per instrument. Then
+consumer parallelism, capped by partition skew. The broker itself is not close.
+Memory and GC behaviour are entirely unexercised — the fixture is too small to
+have pressured them.
 
-```
-exchange A ─┐                     ┌─ trades.raw ─┐
-            ├─ ingest (asyncio) ─►│              ├─ Spark Structured Streaming ─► Parquet lake ─► DuckDB
-exchange B ─┘   normalize +       └─ orderbook.  ┘   windowed aggregates,           (date/hour/
-                dual timestamps      raw              stream-stream join             exchange/symbol)
-                                  (Redpanda)         divergence detection
-```
+See [`RUNBOOK.md`](RUNBOOK.md) for the concrete steps to close these gaps.
 
-Diagram gets replaced with a real one at Milestone 8, per the plan.
-
-## Tech stack
-
-Python 3.11+ / `uv`, `websockets` for ingestion, Redpanda as the broker,
-PySpark Structured Streaming for processing, Parquet on local disk partitioned
-by date/hour, DuckDB for analytics, `pytest`, Docker Compose for local infra.
-
-## Quickstart
-
-```bash
-uv sync
-docker compose up -d          # Redpanda + Console
-./scripts/create_topics.sh    # trades.raw, orderbook.raw, divergence.events
-
-# one process per venue
-uv run python -m xstream.ingest --exchange kraken     --brokers localhost:19092
-uv run python -m xstream.ingest --exchange binance_us --brokers localhost:19092
-```
-
-Then open the Redpanda Console at <http://localhost:8080> to inspect topics.
-
-Redpanda is not required — the pipeline speaks the Kafka protocol, so any
-Kafka-compatible broker works. Point `--brokers` at whatever is running.
-
-Omit `--brokers` to normalize and count messages without producing — useful for
-checking a feed without standing up infrastructure.
-
-### Processing
-
-```bash
-# reconstruct books and publish top-of-book snapshots
-uv run python -m xstream.orderbook.snapshotter --brokers localhost:19092
-
-# windowed aggregates -> Parquet
-uv run python -m xstream.processing.trades_job --brokers localhost:19092
-uv run python -m xstream.processing.book_job   --brokers localhost:19092
-```
-
-Output lands in `data/lake/{candles_1s,candles_10s,candles_1m,book_features}`,
-partitioned `date/hour/exchange/symbol` — coarsest first, so a time-bounded
-query prunes whole directories before opening a file. Query it directly:
-
-```sql
-SELECT exchange, symbol, avg(spread), avg(book_imbalance)
-FROM read_parquet('data/lake/book_features/**/*.parquet', hive_partitioning=true)
-GROUP BY 1, 2;
-```
-
-### Replay without a live connection
-
-The captured fixtures can be pushed through the exact same connector,
-normalizer and sink that production uses:
-
-```bash
-uv run python -m xstream.ingest.replay                        # in memory
-uv run python -m xstream.ingest.replay --brokers localhost:19092
-```
-
-This is how the pipeline is verified in environments that cannot reach the
-exchanges, and it is what Milestone 2's deterministic order book tests and
-Milestone 6's accelerated load tests build on.
-
-### Reconnaissance
-
-```bash
-uv run python scripts/recon/kraken.py --limit 500
-```
-
-Check the exit code before committing samples — exit `3` means the venue
-rejected the subscription and the frames are errors, not market data. See
-[`docs/samples/README.md`](docs/samples/README.md). If the scripts report
-`proxy rejected connection: HTTP 403`, you are behind a restrictive egress
-policy — see [`DECISIONS.md`](DECISIONS.md) D-000.
+---
 
 ## Repository layout
 
 ```
-scripts/recon/          per-exchange connectivity probes (Milestone 0)
-scripts/create_topics.sh
-src/xstream/ingest/     connectors, normalization, producer, runner
-  schema.py             the common internal schema every venue maps onto
-  base.py               the shared connector interface
-  kraken.py             Kraken v2 dialect
-  binance_us.py         Binance.US dialect
-  producer.py           topic routing, partition keying, Redpanda sink
-  runner.py             connect/reconnect/metrics/shutdown
-  replay.py             fixture replay through the real path
-tests/                  pytest suite
-docs/samples/           captured raw frames, used as test fixtures
-docs/SCHEMAS.md         real message schemas per venue, from captured data
-docker-compose.yml      Redpanda + Console
-DECISIONS.md            running log of design decisions and tradeoffs
+scripts/recon/          per-exchange connectivity probes
+src/xstream/ingest/     connectors, normalization, producer, runner, replay
+src/xstream/orderbook/  stateful reconstruction, gap detection, snapshotter
+src/xstream/processing/ Spark jobs: trades, book features, divergence
+src/xstream/analysis/   DuckDB layer, compaction, quality checks, cost model
+src/xstream/bench/      per-stage throughput, load test, consumer lag
+src/xstream/model/      features + evaluation harness
+dashboard/app.py        Streamlit dashboard
+queries/                9 analytical SQL queries
+docs/SCHEMAS.md         real venue message schemas, from captured data
+docs/samples/           captured raw frames used as test fixtures
+DECISIONS.md            31 design decisions and tradeoffs
+BENCHMARKS.md           measured throughput and failure modes
+EVALUATION.md           prediction task and evaluation rigor
+RUNBOOK.md              what is needed to get this running for real
 ```
-
-## The normalization layer
-
-The two venues disagree on essentially every representational choice: envelope
-shape, number encoding, timestamp format, symbol spelling, level structure, and
-how book integrity is verified at all. `schema.py` is where those disagreements
-are resolved exactly once.
-
-| | Kraken v2 | Binance.US |
-| --- | --- | --- |
-| Subscribe | frame, acked per (channel, symbol) | **URL path**, no ack |
-| Envelope | `channel` + `type` | `stream` + `data` |
-| Numbers | **JSON floats** | decimal strings |
-| Timestamps | ISO 8601 | epoch millis |
-| Symbols | `BTC/USD` | `BTCUSD` |
-| Book integrity | **CRC32 checksum** | **update IDs** |
-
-Two consequences worth calling out, both of which would be silent bugs:
-
-- Kraken's JSON numbers become binary floats inside `json.loads` unless it is
-  told otherwise. Order books key on exact price equality, so a price one ULP
-  off is a *different level* — removals miss and the book accumulates phantom
-  levels. Everything parses with `parse_float=Decimal`, and `Decimal` survives
-  to the broker as a string rather than a JSON number.
-- Binance's `m` flag means "the buyer is the maker", so `m: true` is a **sell**
-  aggression. Inverting it would flip the volume-imbalance feature's sign with
-  nothing downstream to catch it.
-
-Because neither venue has both integrity mechanisms, `BookDelta` carries both
-as optional fields rather than collapsing them into one — the pipeline should
-not pretend a checksum and a sequence number are the same thing.
-
-## Documentation
-
-- [`DECISIONS.md`](DECISIONS.md) — design decisions and tradeoffs as they are made
-- `BENCHMARKS.md` — throughput and latency percentiles (Milestone 6)
-- `EVALUATION.md` — prediction task, and the ways it was checked (Milestone 7)

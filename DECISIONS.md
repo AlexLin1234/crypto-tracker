@@ -1056,3 +1056,35 @@ for load testing and none of those figures depends on wall-clock alignment with
 market time. Only latency needs a live connection, which this environment
 cannot open (D-000). Publishing a latency number from this data would be
 measuring the wrong thing and presenting it as the right one.
+
+---
+
+## D-031: A lookahead audit that could not fire
+
+**Date:** 2026-08-11
+**Third instance of the same class of bug in this project.**
+
+`audit_lookahead` verifies that no feature reads future data, by corrupting
+later rows, rebuilding the feature matrix, and confirming earlier rows are
+unchanged. The first implementation perturbed the **final** rows of the input.
+
+`build_features` drops the last `horizon` rows, because a target requires a
+future observation that does not exist for them. So the corrupted rows were
+never in the output being compared, and the audit could not detect anything —
+ever. A test that plants a deliberate `shift(-1)` leak confirmed it: the audit
+reported every feature "clean".
+
+The fix was to match rows on `window_start` rather than positional index —
+positions do not survive a rebuild that drops rows — and to start the corrupted
+block early enough that it survives into the built matrix.
+
+**This is the third detector in this project that was structurally incapable of
+firing**, after the 6-sigma outlier check whose threshold was unreachable at
+small n, and the MAD replacement that collapsed to zero on a near-constant
+series (D-026). All three would have passed code review; all three were caught
+only by testing the detector against a known-positive case.
+
+The general lesson is worth more than any of the three fixes: **every detector
+needs a test that makes it fire.** A detector that only ever reports "clean" is
+indistinguishable from one that works, and it is worse than having no detector
+at all, because its silence reads as evidence.

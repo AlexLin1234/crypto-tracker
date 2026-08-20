@@ -18,14 +18,10 @@ dependencies = [
     "pyarrow>=24.0.0",
     "duckdb>=1.5.5",
     "pandas>=2.2,<3",
+    "scikit-learn>=1.5",
 ]
 
 [project.optional-dependencies]
-# Milestone 7: modelling
-ml = [
-    "scikit-learn>=1.5",
-    "lightgbm>=4.3",
-]
 # Milestone 8: dashboard
 dashboard = [
     "streamlit>=1.36",
