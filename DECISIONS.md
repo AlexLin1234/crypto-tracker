@@ -940,3 +940,119 @@ outliers" on precisely the case of interest — the second way this check nearly
 shipped broken. The prescribed fallback to mean absolute deviation, scaled by
 1.253314, handles it, and only a perfectly constant series now yields no
 outliers, which is correct.
+
+---
+
+## D-027: The bottleneck is checksum verification, and it stays
+
+**Date:** 2026-08-11
+
+Measured, not guessed (`BENCHMARKS.md`): order book reconstruction with CRC32
+verification runs at **33,916 deltas/s**; the identical code path with
+verification disabled runs at **286,232 deltas/s**. Verification is therefore
+**8.4x** the cost of applying the update, and accounts for roughly 88% of the
+time spent in the slowest stage of the pipeline.
+
+Everything else has an order of magnitude or more of headroom: JSON parsing
+runs at ~204k frames/s, normalization at ~237k messages/s, encoding at ~127k/s,
+and the broker sustains **579,260 msg/s** — about 17x the pipeline's own
+ceiling. **This pipeline is CPU-bound in its stateful stage, not I/O-bound at
+the broker**, which means adding brokers or partitions buys nothing until the
+book stage is sharded.
+
+Verification stays on. An unverified book is exactly the silent-corruption
+failure D-013 exists to prevent, and 34k deltas/s is still ~1,500x the
+fixture's real-time rate of 23 msg/s. If it ever became a genuine constraint,
+the honest lever is verifying every Nth update and accepting a bounded
+detection delay — not removing verification and claiming the same guarantees.
+
+The related promise from D-003 is also now settled: `Decimal` parsing costs
+**1.62x** versus float (330,330 → 203,851 frames/s). On a stage running at
+200k/s that is nowhere near the constraint, so the correctness trade was cheap.
+
+---
+
+## D-028: Backpressure is invisible at default settings, and brutal when it fires
+
+**Date:** 2026-08-11
+
+At the default 20,000-message producer queue, **backpressure never occurred** —
+not once across 95,000 messages at 579k msg/s. librdkafka's background thread
+drains faster than a single Python thread can enqueue, so the `BufferError`
+path in `RedpandaSink.send` was effectively dead code in practice.
+
+Forcing it by shrinking the queue to 100 messages:
+
+| queue depth | throughput | BufferError events |
+| ---: | ---: | ---: |
+| 20,000 | 579,260/s | 0 |
+| 100 | **926/s** | **474** |
+
+**A 625x collapse.** Each `BufferError` blocks the producing thread in `poll()`
+until the queue drains.
+
+This is the correct behaviour — the alternative is silently discarding market
+data, which is the one outcome this project treats as unacceptable — but two
+things follow. First, queue depth is a tuning knob with a very sharp edge
+rather than a smooth trade. Second, and worse operationally, **the symptom looks
+nothing like the cause**: throughput collapses, no errors are logged, nothing
+crashes, and the pipeline simply becomes slow. Anyone debugging that from the
+outside would suspect the broker or the network long before the queue setting.
+
+---
+
+## D-029: Skew was designed in at D-008; here is what it actually costs
+
+**Date:** 2026-08-11
+
+Measured over a 171,000-message topic with 6 partitions:
+
+| partition | messages | share |
+| ---: | ---: | ---: |
+| 2 | 46,080 | 26.9% |
+| 3 | 124,920 | 73.1% |
+| 0, 1, 4, 5 | 0 | 0% |
+
+Two of six partitions carry everything, and one holds 73.1% of it. Spark
+launches 6 tasks, 4 of which read nothing, and the busiest does **2.71x** the
+work of the other.
+
+None of this is a surprise — D-008 predicted it when it chose symbol keying so
+that per-venue ordering is preserved and the divergence join gets partition
+locality. What the measurement adds is the magnitude, and one consequence that
+was not obvious when the decision was made: **the skew caps consumer group
+parallelism at 2**, because a consumer group cannot usefully have more members
+than partitions with data. Consumer drain measured 44,045 msg/s for a single
+consumer, so the ceiling for this topic is roughly 88k msg/s no matter how many
+consumers are added.
+
+That makes partition skew a live constraint at the consumer before it becomes
+one anywhere else, and it is the first thing to revisit if throughput ever
+needs to scale past the book stage. The fix is more symbols — which spreads
+keys naturally and costs nothing — well before it is a composite key.
+
+---
+
+## D-030: No latency figures are published, because none can be measured here
+
+**Date:** 2026-08-11
+
+`BENCHMARKS.md` deliberately contains no p50/p95/p99 latency table.
+
+Latency is venue timestamp minus ingest timestamp. On a live feed that is real
+end-to-end latency; on a **replayed fixture it is the age of the capture**. The
+data was captured on 2026-08-02 and replayed on 2026-08-11, and the pipeline
+duly reported a p50 of roughly 808,500,000 ms — about nine days. The number is
+arithmetically correct and analytically worthless, which is the dangerous
+combination: it looks like a measurement.
+
+Rather than omit it silently,
+`queries/03_ingest_latency_percentiles.sql` emits a `measurement_valid` column
+reading `NO - replayed fixture, not live ingest` whenever the maximum exceeds a
+minute, since nothing attributable to network latency lasts that long.
+
+**Throughput benchmarks from replay remain valid** — replay is the correct tool
+for load testing and none of those figures depends on wall-clock alignment with
+market time. Only latency needs a live connection, which this environment
+cannot open (D-000). Publishing a latency number from this data would be
+measuring the wrong thing and presenting it as the right one.

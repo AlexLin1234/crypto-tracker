@@ -10,10 +10,39 @@ trading bot.** The prediction task in Milestone 7 exists as a vehicle for
 demonstrating evaluation rigor, not as a claim that anything here is
 profitable.
 
-> **Project status: Milestone 5 complete.** Ingestion, order book
+> **Project status: Milestone 6 complete.** Ingestion, order book
 > reconstruction, Spark aggregation, cross-exchange divergence, and a DuckDB
 > analytical layer with compaction, data-quality checks and a one-command
-> report. 130 tests pass. Milestone 6 (benchmarks) is next.
+> report, and measured benchmarks. 142 tests pass. Milestone 7 (prediction +
+> evaluation rigor) is next.
+
+## Benchmarks
+
+Full numbers in [`BENCHMARKS.md`](BENCHMARKS.md). The headline:
+
+| | |
+| --- | --- |
+| **Bottleneck** | Book reconstruction with checksum verification, **~34,000 deltas/s** |
+| Producer ceiling | 579,260 msg/s |
+| Consumer drain | 44,045 msg/s |
+| Cost of `Decimal` correctness | **1.62x** slower parsing |
+| Cost of checksum correctness | **8.4x** slower book updates |
+| Latency percentiles | **not measured — replay makes them meaningless** |
+
+The pipeline is **CPU-bound in its stateful stage, not I/O-bound at the
+broker** — the broker sustains ~17x the pipeline's own ceiling, so adding
+brokers buys nothing until books are sharded by (exchange, symbol).
+
+Checksum verification is 88% of the bottleneck stage and stays on anyway: an
+unverified book is the silent-corruption failure the design exists to prevent,
+and 34k deltas/s is still ~1,500x the fixture's real-time rate.
+
+Two induced failures worth knowing. **Backpressure never fires at default
+settings** but collapses throughput 625x (579,260 → 926 msg/s) when the queue
+is undersized — with no errors logged, so the symptom looks nothing like the
+cause. And the symbol-keyed **partition skew designed in at D-008** puts 73.1%
+of messages in one partition and leaves 4 of 6 empty, which caps consumer-group
+parallelism at 2.
 
 ## Storage and analytics
 
@@ -53,15 +82,12 @@ because an outlier inflates the standard deviation it would be judged against
 (D-026), and ingest latency is explicitly flagged invalid on replayed data,
 where it measures fixture age rather than network latency (D-024).
 
-> **Milestone 4 note: its real-data output is empty.**
-> Ingestion, order book reconstruction, Spark aggregation into a Parquet lake,
-> and the cross-exchange divergence join with a net-of-costs honesty layer.
-> 111 tests pass. The divergence job runs clean and emits **zero rows**, because
-> the captured data has no cross-venue overlap — see "Cross-exchange divergence"
-> below and [`DECISIONS.md`](DECISIONS.md) D-021. **No empirical claim about
-> real divergence has been made or can be made from this data.**
-
 ## Cross-exchange divergence
+
+> **This section's job runs clean and produces zero rows on the captured data**,
+> because it has no cross-venue overlap. **No empirical claim about real
+> divergence has been made or can be made from this data** — see "What this
+> project has not shown" below and [`DECISIONS.md`](DECISIONS.md) D-021.
 
 Two venue streams aligned onto a shared event-time grid, then equi-joined on
 `(symbol, window_start)`. Aligning first is what makes differing update rates
